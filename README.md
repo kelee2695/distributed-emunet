@@ -12,3 +12,8 @@ make install ##需要sudo权限
 cd ../emunet-operator-node/
 KUBECONFIG=./ssl/emunet-operator.kubeconfig make run .
 ```
+# Master controller运行(在master机器上执行)
+```
+cd ../emunet-operator-master/
+KUBECONFIG=./ssl/emunet-operator.kubeconfig make run .
+```
