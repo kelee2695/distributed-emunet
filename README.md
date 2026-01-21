@@ -7,6 +7,11 @@ cd ../mac-cni/
 REMOTE_IP=192.168.1.104 make mac-cni
 make install ##需要sudo权限
 ```
+# CNI配置文件导入
+```
+cd ../config
+sudo cp ./00-EMU_MAC-conflist.conflist /etc/cni/net.d/
+```
 # Node Agent运行(在节点机执行，需要sudo权限)
 ```
 cd ../emunet-operator-node/
