@@ -1,10 +1,10 @@
 curl -X POST http://192.168.1.103:12345/api/ebpf/entry \
   -H "Content-Type: application/json" \
   -d '{
-    "ifindex": 1300,
-    "srcMac": "52:cd:ff:94:94:0e",
+    "ifindex": 1344,
+    "srcMac": "1a:e3:3c:5a:ec:5e",
     "throttleRateBps": 1000000,
-    "delay": 100,
+    "delay": 1000,
     "lossRate": 500,
     "jitter": 10
   }'
@@ -12,8 +12,8 @@ curl -X POST http://192.168.1.103:12345/api/ebpf/entry \
 curl -X DELETE http://192.168.1.103:12345/api/ebpf/entry \
   -H "Content-Type: application/json" \
   -d '{
-    "ifindex": 1300,  
-    "srcMac": "52:cd:ff:94:94:0e" 
+    "ifindex": 1344,  
+    "srcMac": "1a:e3:3c:5a:ec:5e" 
   }'
 
   curl -X POST http://localhost:8080/apis/emunet.emunet.io/v1/namespaces/default/emunets \
