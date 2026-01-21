@@ -1,0 +1,14 @@
+{
+    "cniVersion": "0.3.1",
+    "name": "EMU_MAC_CNI_NET",
+    "plugins": [
+        {
+            "type": "MAC_CNI",
+            "name": "MAC_CNI_NET"
+        },
+        {
+            "type": "EMU_CNI", 
+            "name": "EMU_CNI_NET"
+        }
+    ]
+}
