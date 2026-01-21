@@ -20,3 +20,4 @@ run:
 .PHONY: install
 install:
 	sudo cp $(CNI_BIN) /opt/cni/bin/
+	rm -f $(CNI_BIN)
