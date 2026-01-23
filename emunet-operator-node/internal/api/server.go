@@ -16,11 +16,14 @@ import (
 )
 
 type Server struct {
-	router       *mux.Router
-	podInfoStore *controller.PodInfoStore
-	semaphore    chan struct{}
-	metrics      *ServerMetrics
-	ebpfMap      *ebpf.Map
+	router         *mux.Router
+	podInfoStore   *controller.PodInfoStore
+	semaphore      chan struct{}
+	metrics        *ServerMetrics
+	ebpfMap        *ebpf.Map
+	ebpfMapMutex   sync.RWMutex
+	ebpfMapLoaded  bool
+	ebpfMapLoadErr error
 }
 
 type ServerMetrics struct {
@@ -57,17 +60,14 @@ type ApiData struct {
 }
 
 func NewServer() *Server {
-	ebpfMap, err := pkg.LoadEBPFMap(pkg.DefaultEBPFMapPath)
-	if err != nil {
-		fmt.Printf("[WARN] Failed to load eBPF map: %v\n", err)
-	}
-
 	s := &Server{
-		router:       mux.NewRouter(),
-		podInfoStore: controller.GetGlobalPodInfoStore(),
-		semaphore:    make(chan struct{}, 1000),
-		metrics:      &ServerMetrics{},
-		ebpfMap:      ebpfMap,
+		router:         mux.NewRouter(),
+		podInfoStore:   controller.GetGlobalPodInfoStore(),
+		semaphore:      make(chan struct{}, 1000),
+		metrics:        &ServerMetrics{},
+		ebpfMap:        nil,
+		ebpfMapLoaded:  false,
+		ebpfMapLoadErr: nil,
 	}
 	s.setupRoutes()
 	return s
@@ -277,6 +277,44 @@ func (s *Server) deletePodInfo(podName string) {
 	s.podInfoStore.Delete(podName)
 }
 
+func (s *Server) loadEBPFMap() error {
+	s.ebpfMapMutex.Lock()
+	defer s.ebpfMapMutex.Unlock()
+
+	if s.ebpfMapLoaded {
+		return s.ebpfMapLoadErr
+	}
+
+	ebpfMap, err := pkg.LoadEBPFMap(pkg.DefaultEBPFMapPath)
+	if err != nil {
+		s.ebpfMapLoadErr = err
+		s.ebpfMapLoaded = true
+		return err
+	}
+
+	s.ebpfMap = ebpfMap
+	s.ebpfMapLoaded = true
+	s.ebpfMapLoadErr = nil
+	fmt.Printf("[INFO] eBPF map loaded successfully from %s\n", pkg.DefaultEBPFMapPath)
+	return nil
+}
+
+func (s *Server) getEBPFMap() (*ebpf.Map, error) {
+	s.ebpfMapMutex.RLock()
+	if s.ebpfMapLoaded {
+		s.ebpfMapMutex.RUnlock()
+		return s.ebpfMap, s.ebpfMapLoadErr
+	}
+	s.ebpfMapMutex.RUnlock()
+
+	err := s.loadEBPFMap()
+	if err != nil {
+		return nil, err
+	}
+
+	return s.ebpfMap, nil
+}
+
 func (s *Server) handleEBPFEntry(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	s.recordRequestStart()
@@ -299,9 +337,10 @@ func (s *Server) handleEBPFEntry(w http.ResponseWriter, r *http.Request) {
 	fmt.Printf("[REQUEST] %s %s\n", r.Method, r.URL.Path)
 
 	if r.Method == "POST" {
-		if s.ebpfMap == nil {
+		ebpfMap, err := s.getEBPFMap()
+		if err != nil {
 			s.recordRequestEnd(false, false)
-			http.Error(w, "eBPF map not available", http.StatusServiceUnavailable)
+			http.Error(w, fmt.Sprintf("eBPF map not available: %v", err), http.StatusServiceUnavailable)
 			return
 		}
 
@@ -320,7 +359,7 @@ func (s *Server) handleEBPFEntry(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if err := pkg.AddEBPFEntry(s.ebpfMap, req.Ifindex, req.SrcMac, req.ThrottleRateBps, req.Delay, req.LossRate, req.Jitter); err != nil {
+		if err := pkg.AddEBPFEntry(ebpfMap, req.Ifindex, req.SrcMac, req.ThrottleRateBps, req.Delay, req.LossRate, req.Jitter); err != nil {
 			s.recordRequestEnd(false, false)
 			http.Error(w, fmt.Sprintf("Failed to add eBPF entry: %v", err), http.StatusInternalServerError)
 			return
@@ -339,9 +378,10 @@ func (s *Server) handleEBPFEntry(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(response)
 	} else if r.Method == "DELETE" {
-		if s.ebpfMap == nil {
+		ebpfMap, err := s.getEBPFMap()
+		if err != nil {
 			s.recordRequestEnd(false, false)
-			http.Error(w, "eBPF map not available", http.StatusServiceUnavailable)
+			http.Error(w, fmt.Sprintf("eBPF map not available: %v", err), http.StatusServiceUnavailable)
 			return
 		}
 
@@ -356,7 +396,7 @@ func (s *Server) handleEBPFEntry(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if err := pkg.DeleteEBPFEntry(s.ebpfMap, req.Ifindex, req.SrcMac); err != nil {
+		if err := pkg.DeleteEBPFEntry(ebpfMap, req.Ifindex, req.SrcMac); err != nil {
 			s.recordRequestEnd(false, false)
 			http.Error(w, fmt.Sprintf("Failed to delete eBPF entry: %v", err), http.StatusInternalServerError)
 			return

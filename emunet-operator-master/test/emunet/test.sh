@@ -21,3 +21,22 @@ curl -X DELETE http://192.168.1.103:12345/api/ebpf/entry \
   --data-binary @config/samples/emunet_v1_emunet.yaml
 
   curl -X DELETE http://localhost:8080/apis/emunet.emunet.io/v1/namespaces/default/emunets/emunet-example
+
+
+curl -X POST http://localhost:8082/api/v1/ebpf/entry/by-pods \
+  -H "Content-Type: application/json" \
+  -d '{
+    "pod1": "emunet-example-group0-4",
+    "pod2": "emunet-example-group0-3",
+    "throttleRateBps": 1000000,
+    "delay": 1000,
+    "lossRate": 2500,
+    "jitter": 10
+  }'
+
+curl -X DELETE http://localhost:8082/api/v1/ebpf/entry/by-pods \
+  -H "Content-Type: application/json" \
+  -d '{
+    "pod1": "emunet-example-group0-4",
+    "pod2": "emunet-example-group0-3"
+  }'
