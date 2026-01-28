@@ -257,13 +257,7 @@ func podStatusMessage(pod *corev1.Pod) string {
 	return ""
 }
 
-func getNodeName() string {
-	hostname, err := os.Hostname()
-	if err != nil {
-		return ""
-	}
-	return hostname
-}
+
 
 func (r *EmuNetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).

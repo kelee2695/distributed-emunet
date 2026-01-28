@@ -130,5 +130,5 @@ func getNodeName() string {
 	if err != nil {
 		return ""
 	}
-	return hostname
+	return strings.ToLower(hostname)
 }
