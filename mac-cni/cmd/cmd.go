@@ -70,13 +70,13 @@ func (c *Cmd) Add(args *skel.CmdArgs) error {
 		VNI:        100,                          // VXLAN网络标识符
 		RemoteIP:   net.ParseIP(RemoteIP),        // 对端物理IP地址（编译时配置）
 		BridgeName: "vxlanBr",                    // 已存在的网桥名称
-		Device:     "enp1s0",                     // 底层物理网卡
+		Device:     "tailscale0",                     // 底层物理网卡
 		Port:       4789,                         // VXLAN端口
 		Learning:   true,                         // 启用MAC地址学习
 		GBP:        false,                        // 禁用组策略扩展
 		Ageing:     300,                          // MAC地址老化时间（秒）
 		TTL:        16,                           // 多播TTL
-		MTU:        1450,                         // 接口MTU
+		MTU:        1200,                         // 接口MTU
 	}
 	// 创建 VXLAN 接口（创建函数内包含检查是否存在逻辑，若存在则直接返回nil）
 	if err := vxlan.CreateVXLAN(config); err != nil {

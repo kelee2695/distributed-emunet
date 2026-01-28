@@ -19,5 +19,7 @@ run:
 
 .PHONY: install
 install:
+	sudo ip link delete vxlan0 2>/dev/null || true
+	sudo ip link delete vxlanBr 2>/dev/null || true
 	sudo cp $(CNI_BIN) /opt/cni/bin/
 	rm -f $(CNI_BIN)

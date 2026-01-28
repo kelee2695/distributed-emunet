@@ -4,7 +4,7 @@ cd ./emu-cni/
 LOG_PATH=/var/log/emu-cni.log make emu-cni
 make install ##需要sudo权限
 cd ../mac-cni/
-REMOTE_IP=192.168.1.104 make mac-cni
+REMOTE_IP=100.90.181.123 make mac-cni
 make install ##需要sudo权限
 ```
 # CNI配置文件导入
