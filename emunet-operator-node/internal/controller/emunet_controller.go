@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"os"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -256,8 +255,6 @@ func podStatusMessage(pod *corev1.Pod) string {
 	}
 	return ""
 }
-
-
 
 func (r *EmuNetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).

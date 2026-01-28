@@ -5,6 +5,7 @@ import (
 	"flag"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
