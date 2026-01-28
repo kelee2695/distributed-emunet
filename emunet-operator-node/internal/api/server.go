@@ -74,10 +74,10 @@ func NewServer() *Server {
 }
 
 func (s *Server) setupRoutes() {
-	s.router.HandleFunc("/api/podinfo/", s.handlePodInfo)
-	s.router.HandleFunc("/api/podinfo/add", s.handlePodInfoAdd)
-	s.router.HandleFunc("/api/ebpf/entry", s.handleEBPFEntry)
-	s.router.HandleFunc("/health", s.handleHealth)
+	s.router.HandleFunc("/api/podinfo/{podName}", s.handlePodInfo).Methods("GET", "DELETE")
+	s.router.HandleFunc("/api/podinfo/add", s.handlePodInfoAdd).Methods("POST")
+	s.router.HandleFunc("/api/ebpf/entry", s.handleEBPFEntry).Methods("POST", "DELETE")
+	s.router.HandleFunc("/health", s.handleHealth).Methods("GET")
 }
 
 func (s *Server) recordRequestStart() {
@@ -131,7 +131,8 @@ func (s *Server) handlePodInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	podName := r.URL.Path[len("/api/podinfo/"):]
+	vars := mux.Vars(r)
+	podName := vars["podName"]
 
 	fmt.Printf("[REQUEST] %s %s (PodName: %s)\n", r.Method, r.URL.Path, podName)
 
