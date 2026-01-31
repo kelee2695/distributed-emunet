@@ -30,6 +30,10 @@ const (
 	EmuNetFinalizer     = "emunet.emunet.io/finalizer"
 	EmuNetLabelKey      = "emunet.emunet.io/name"
 	EmuNetGroupLabelKey = "emunet.emunet.io/image-group"
+
+	// 轮询间隔：未就绪时快，就绪后慢
+	SyncPeriodFast = 3 * time.Second
+	SyncPeriodSlow = 30 * time.Second
 )
 
 // Reconcile is the main loop
@@ -66,12 +70,21 @@ func (r *EmuNetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	// 2. Update Status (K8s Status & Redis Cache)
-	if err := r.updateStatus(ctx, emunet); err != nil {
+	// 这个方法现在返回一个 bool，指示系统是否已经完全 Ready
+	isReady, err := r.updateStatus(ctx, emunet)
+	if err != nil {
 		logger.Error(err, "failed to update status")
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{}, nil
+	// 3. 智能轮询 (Smart Polling)
+	// 核心逻辑：Agent 写入 Redis 不会触发 K8s 事件，所以 Master 必须主动轮询 Redis。
+	// 如果所有 Pod 都 Ready 了，我们降低轮询频率到 30s。
+	// 如果还有 Pod 没 Ready（或者 MAC 还没上报），我们保持 3s 高频轮询。
+	if isReady {
+		return ctrl.Result{RequeueAfter: SyncPeriodSlow}, nil
+	}
+	return ctrl.Result{RequeueAfter: SyncPeriodFast}, nil
 }
 
 func (r *EmuNetReconciler) syncPods(ctx context.Context, emunet *emunetv1.EmuNet) error {
@@ -124,7 +137,8 @@ func (r *EmuNetReconciler) syncPods(ctx context.Context, emunet *emunetv1.EmuNet
 	return nil
 }
 
-func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.EmuNet) error {
+// updateStatus returns (isReady, error)
+func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.EmuNet) (bool, error) {
 	logger := log.FromContext(ctx)
 
 	// Fetch latest pods
@@ -134,7 +148,7 @@ func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.Em
 		client.MatchingLabels{EmuNetLabelKey: emunet.Name},
 	}
 	if err := r.List(ctx, pods, listOptions...); err != nil {
-		return err
+		return false, err
 	}
 
 	// Calculate Status
@@ -144,7 +158,6 @@ func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.Em
 	}
 
 	// Reuse existing MAC/IfIndex info from previous status if available
-	// This helps in case Redis read fails temporarily
 	existingPodStatusMap := make(map[string]emunetv1.PodStatus)
 	for _, group := range emunet.Status.ImageGroupStatus {
 		for _, podStatus := range group.PodStatuses {
@@ -152,8 +165,8 @@ func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.Em
 		}
 	}
 
-	// [关键变更] 这里会去 Redis 拉取 Agent 上报的数据
-	imageGroupStatus, totalReady := r.calculateImageGroupStatus(ctx, emunet, podMap, existingPodStatusMap)
+	// [关键] 从 Redis 拉取最新 MAC 信息
+	imageGroupStatus, totalReady, allMacsFound := r.calculateImageGroupStatus(ctx, emunet, podMap, existingPodStatusMap)
 
 	// 1. Update K8s Status (Optimistic Locking via Patch)
 	newStatus := emunet.Status.DeepCopy()
@@ -162,17 +175,19 @@ func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.Em
 	newStatus.ImageGroupStatus = imageGroupStatus
 	newStatus.ObservedGen = emunet.Generation
 
+	// Only patch if something changed
 	if !equality.Semantic.DeepEqual(emunet.Status, *newStatus) {
 		patch := client.MergeFrom(emunet.DeepCopy())
 		emunet.Status = *newStatus
 		if err := r.Status().Patch(ctx, emunet, patch); err != nil {
-			return err
+			return false, err
 		}
+		logger.Info("updated emunet status", "ready", totalReady, "target", emunet.Spec.TotalReplicas)
 	}
 
-	// 2. Update Redis (Using Batch Pipeline)
-	// Master 将 K8s 中的权威信息 (IP, Node) 合并后反写回 Redis，
-	// 确保 Redis 中既有 Agent 上报的 MAC，又有 K8s 分配的 IP。
+	// 2. Update Redis
+	// 将合并了 (Agent MAC) + (K8s IP) 的完整信息写回 Redis
+	// 这样 Master Server 就能通过 GetPodInfoDirectly 查到包含 IP 的完整信息
 	redisStatus := &redis.EmuNetStatus{
 		Name:             emunet.Name,
 		Namespace:        emunet.Namespace,
@@ -183,13 +198,13 @@ func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.Em
 		LastUpdated:      time.Now(),
 	}
 
-	// Call the batch save method
 	if err := r.saveStatusToRedis(ctx, redisStatus); err != nil {
 		logger.Error(err, "failed to update redis cache")
-		// We don't return error to avoid crash looping K8s reconciliation due to Redis issues
 	}
 
-	return nil
+	// 判断系统是否完全就绪：Pod 数量够了 && 所有 Pod 的 MAC 地址都拿到了
+	isFullyReady := (totalReady == emunet.Spec.TotalReplicas) && allMacsFound
+	return isFullyReady, nil
 }
 
 func (r *EmuNetReconciler) saveStatusToRedis(ctx context.Context, status *redis.EmuNetStatus) error {
@@ -217,10 +232,11 @@ func (r *EmuNetReconciler) handleDeletion(ctx context.Context, nn types.Namespac
 
 // --- Helpers ---
 
-// [核心逻辑] 合并 K8s Pod 状态与 Redis Agent 数据
-func (r *EmuNetReconciler) calculateImageGroupStatus(ctx context.Context, emunet *emunetv1.EmuNet, podMap map[string]*corev1.Pod, existingStatus map[string]emunetv1.PodStatus) ([]emunetv1.ImageGroupStatus, int32) {
+// calculateImageGroupStatus 返回：Status 列表, Ready 数量, 是否所有 Running Pod 的 MAC 都找到了
+func (r *EmuNetReconciler) calculateImageGroupStatus(ctx context.Context, emunet *emunetv1.EmuNet, podMap map[string]*corev1.Pod, existingStatus map[string]emunetv1.PodStatus) ([]emunetv1.ImageGroupStatus, int32, bool) {
 	var imageGroupStatus []emunetv1.ImageGroupStatus
 	var totalReady int32
+	allMacsFound := true // 假设所有 MAC 都找到了，除非发现没有
 
 	for groupIdx, imageGroup := range emunet.Spec.ImageGroups {
 		groupStatus := emunetv1.ImageGroupStatus{
@@ -240,7 +256,7 @@ func (r *EmuNetReconciler) calculateImageGroupStatus(ctx context.Context, emunet
 				LastUpdated: metav1.Now(),
 			}
 
-			// 1. 继承旧状态 (防止 flickering)
+			// 1. 继承旧状态
 			if old, ok := existingStatus[podName]; ok {
 				podStatus.MACAddress = old.MACAddress
 				podStatus.VethIfIndex = old.VethIfIndex
@@ -254,21 +270,21 @@ func (r *EmuNetReconciler) calculateImageGroupStatus(ctx context.Context, emunet
 				podStatus.Ready = isPodReady(pod)
 				podStatus.Message = getPodMessage(pod)
 
-				// 3. [关键步骤] 如果 Pod 正在运行，尝试从 Redis 补全网络信息
-				if podStatus.Phase == corev1.PodRunning {
-					// 尝试从 Redis 直接读取 (O(1) 查找) Agent 上报的数据
-					// 注意：GetPodInfoDirectly 返回的是 Agent 写入的简版数据 (仅含 MAC/Index)
-					redisInfo, err := r.Redis.GetPodInfoDirectly(ctx, podName)
-					if err == nil && redisInfo != nil {
-						// 只有当 Redis 里有新数据时才覆盖
-						if redisInfo.MACAddress != "" {
-							podStatus.MACAddress = redisInfo.MACAddress
-						}
-						// 0 通常是无效 index
-						if redisInfo.VethIfIndex != 0 {
-							podStatus.VethIfIndex = redisInfo.VethIfIndex
-						}
+				// 3. 尝试从 Redis 读取 MAC/IfIndex
+				// 不论 Pod 状态如何，只要 Redis 有数据我们就读，防止 Pod 刚重启时状态不稳但 Redis 有数据的情况
+				redisInfo, err := r.Redis.GetPodInfoDirectly(ctx, podName)
+				if err == nil && redisInfo != nil {
+					if redisInfo.MACAddress != "" {
+						podStatus.MACAddress = redisInfo.MACAddress
 					}
+					if redisInfo.VethIfIndex != 0 {
+						podStatus.VethIfIndex = redisInfo.VethIfIndex
+					}
+				}
+
+				// 检查是否缺失 MAC
+				if podStatus.Phase == corev1.PodRunning && podStatus.MACAddress == "" {
+					allMacsFound = false
 				}
 			}
 
@@ -280,7 +296,7 @@ func (r *EmuNetReconciler) calculateImageGroupStatus(ctx context.Context, emunet
 		}
 		imageGroupStatus = append(imageGroupStatus, groupStatus)
 	}
-	return imageGroupStatus, totalReady
+	return imageGroupStatus, totalReady, allMacsFound
 }
 
 func (r *EmuNetReconciler) updateExistingPod(ctx context.Context, pod *corev1.Pod, desiredImage string) error {
