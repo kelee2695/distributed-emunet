@@ -1,135 +1,109 @@
 package main
 
 import (
-	"crypto/tls"
+	"context"
 	"flag"
 	"net/http"
 	"os"
-	"strings"
+	"os/signal"
+	"syscall"
 	"time"
 
-	_ "k8s.io/client-go/plugin/pkg/client/auth"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
-	"k8s.io/apimachinery/pkg/runtime"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/healthz"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
-
-	emunetv1 "github.com/emunet/emunet-operator/api/v1"
+	// 仅引入必要的内部包
 	"github.com/emunet/emunet-operator/internal/api"
-	"github.com/emunet/emunet-operator/internal/controller"
+	"github.com/emunet/emunet-operator/internal/redis"
 )
-
-var (
-	scheme   = runtime.NewScheme()
-	setupLog = ctrl.Log.WithName("setup")
-)
-
-func init() {
-	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-	utilruntime.Must(emunetv1.AddToScheme(scheme))
-}
 
 func main() {
 	var apiAddr string
-	var enableLeaderElection bool
-	var probeAddr string
-	var enableHTTP2 bool
-	var tlsOpts []func(*tls.Config)
-	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address of the probe endpoint binds to.")
-	flag.StringVar(&apiAddr, "api-bind-address", ":12345", "The address of the REST API endpoint binds to.")
-	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
-		"Enable leader election for controller manager. "+
-			"Enabling this will ensure there is only one active controller manager.")
-	flag.BoolVar(&enableHTTP2, "enable-http2", false,
-		"If set, HTTP/2 will be enabled for the webhook server")
-	opts := zap.Options{
-		Development: true,
-	}
-	opts.BindFlags(flag.CommandLine)
+	var redisAddr string
+	var redisPassword string
+	var redisDB int
+
+	// 1. 配置参数
+	// Agent 默认监听 12345
+	flag.StringVar(&apiAddr, "api-bind-address", ":12345", "The address the Agent API endpoint binds to.")
+
+	// Redis 配置 (Agent 通过 Service DNS 连接)
+	flag.StringVar(&redisAddr, "redis-addr", "emunet-redis.default.svc.cluster.local:6379", "The address of the Redis server")
+	flag.StringVar(&redisPassword, "redis-password", "", "The password of the Redis server")
+	flag.IntVar(&redisDB, "redis-db", 0, "The Redis database index")
+
 	flag.Parse()
 
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	// 2. 初始化日志 (生产环境建议 JSON 格式)
+	config := zap.NewProductionConfig()
+	config.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+	zapLog, _ := config.Build()
+	defer zapLog.Sync()
+	logger := zapLog.Sugar()
 
-	disableHTTP2 := func(c *tls.Config) {
-		setupLog.Info("disabling http/2")
-		c.NextProtos = []string{"http/1.1"}
+	logger.Infow("Starting EmuNet Agent", "version", "v1.0", "address", apiAddr)
+
+	// 3. 权限检查 (必须 Root 才能操作 eBPF)
+	if os.Geteuid() != 0 {
+		logger.Warn("WARNING: Agent is NOT running as root. eBPF operations will likely fail!")
 	}
 
-	if !enableHTTP2 {
-		tlsOpts = append(tlsOpts, disableHTTP2)
+	// 4. 初始化 Redis 客户端
+	// Agent 启动时必须连接上 Redis，否则无法上报自己的存在
+	logger.Infow("Connecting to Redis", "addr", redisAddr)
+	redisClient := redis.NewClient(redisAddr, redisPassword, redisDB)
+
+	// 健康检查: 确保 Redis 通畅
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := redisClient.Ping(ctx); err != nil {
+		cancel()
+		logger.Fatalw("Failed to connect to Redis", "error", err)
+	}
+	cancel()
+	logger.Info("Connected to Redis successfully")
+
+	// 5. 初始化 Agent Server
+	// 注入 Redis 客户端，移除所有 K8s 相关依赖
+	agentServer := api.NewServer(redisClient)
+
+	// 6. 配置 HTTP Server
+	server := &http.Server{
+		Addr:         apiAddr,
+		Handler:      agentServer.GetRouter(),
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
-	webhookTLSOpts := tlsOpts
-	webhookServerOptions := webhook.Options{
-		TLSOpts: webhookTLSOpts,
-	}
-
-	webhookServer := webhook.NewServer(webhookServerOptions)
-
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 scheme,
-		WebhookServer:          webhookServer,
-		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "dcc08e36.emunet.io",
-	})
-	if err != nil {
-		setupLog.Error(err, "unable to start manager")
-		os.Exit(1)
-	}
-
-	if err := (&controller.EmuNetReconciler{
-		Client:       mgr.GetClient(),
-		Scheme:       mgr.GetScheme(),
-		PodInfoStore: controller.GetGlobalPodInfoStore(),
-		NodeName:     getNodeName(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "EmuNet")
-		os.Exit(1)
-	}
-
-	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up health check")
-		os.Exit(1)
-	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up ready check")
-		os.Exit(1)
-	}
-
-	apiServer := api.NewServer()
+	// 7. 启动服务 (Goroutine)
 	go func() {
-		setupLog.Info("starting REST API server", "address", apiAddr)
-
-		server := &http.Server{
-			Addr:         apiAddr,
-			Handler:      apiServer.GetRouter(),
-			ReadTimeout:  60 * time.Second,
-			WriteTimeout: 60 * time.Second,
-			IdleTimeout:  120 * time.Second,
-		}
-
-		if err := server.ListenAndServe(); err != nil {
-			setupLog.Error(err, "problem running REST API server")
-			os.Exit(1)
+		logger.Info("Listening for HTTP requests...")
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Fatalw("Agent server crashed", "error", err)
 		}
 	}()
 
-	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		setupLog.Error(err, "problem running manager")
-		os.Exit(1)
-	}
-}
+	// 8. 优雅退出 (Graceful Shutdown)
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
-func getNodeName() string {
-	hostname, err := os.Hostname()
-	if err != nil {
-		return ""
+	// 阻塞等待信号
+	sig := <-stop
+	logger.Infow("Shutting down Agent...", "signal", sig)
+
+	// 这里的 Context 控制关闭超时时间
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+
+	// 关闭 HTTP 服务
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		logger.Errorw("Server forced to shutdown", "error", err)
 	}
-	return strings.ToLower(hostname)
+
+	// 关闭 Redis 连接
+	if err := redisClient.Close(); err != nil {
+		logger.Errorw("Error closing Redis connection", "error", err)
+	}
+
+	logger.Info("Agent exited cleanly")
 }

@@ -6,11 +6,11 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -32,201 +32,55 @@ const (
 	EmuNetGroupLabelKey = "emunet.emunet.io/image-group"
 )
 
+// Reconcile is the main loop
 func (r *EmuNetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	logger.Info("reconciling", "namespace", req.Namespace, "name", req.Name)
 
 	emunet := &emunetv1.EmuNet{}
 	if err := r.Get(ctx, req.NamespacedName, emunet); err != nil {
 		if errors.IsNotFound(err) {
-			logger.Info("emunet not found, ignoring")
 			return ctrl.Result{}, nil
 		}
 		logger.Error(err, "failed to get emunet")
 		return ctrl.Result{}, err
 	}
 
+	// Handle Deletion
 	if !emunet.DeletionTimestamp.IsZero() {
-		logger.Info("emunet is being deleted")
-		return r.handleDeletion(ctx, req.NamespacedName)
+		return r.handleDeletion(ctx, req.NamespacedName, emunet)
 	}
 
+	// Add Finalizer if missing
 	if !controllerutil.ContainsFinalizer(emunet, EmuNetFinalizer) {
-		logger.Info("adding finalizer")
-		if err := r.addFinalizer(ctx, req.NamespacedName); err != nil {
-			logger.Error(err, "failed to add finalizer")
+		controllerutil.AddFinalizer(emunet, EmuNetFinalizer)
+		if err := r.Update(ctx, emunet); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{}, nil
 	}
 
-	logger.Info("syncing pods")
-	if err := r.syncPods(ctx, req.NamespacedName); err != nil {
+	// 1. Sync Pods (Create/Update/Delete)
+	if err := r.syncPods(ctx, emunet); err != nil {
 		logger.Error(err, "failed to sync pods")
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+		return ctrl.Result{}, err
 	}
 
-	logger.Info("updating status")
-	if err := r.updateStatus(ctx, req.NamespacedName); err != nil {
+	// 2. Update Status (K8s Status & Redis Cache)
+	if err := r.updateStatus(ctx, emunet); err != nil {
 		logger.Error(err, "failed to update status")
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, err
-	}
-
-	logger.Info("reconciliation completed successfully")
-	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-}
-
-func (r *EmuNetReconciler) addFinalizer(ctx context.Context, namespacedName types.NamespacedName) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latestEmuNet := &emunetv1.EmuNet{}
-		if err := r.Get(ctx, namespacedName, latestEmuNet); err != nil {
-			return err
-		}
-
-		if !controllerutil.ContainsFinalizer(latestEmuNet, EmuNetFinalizer) {
-			original := latestEmuNet.DeepCopy()
-			controllerutil.AddFinalizer(latestEmuNet, EmuNetFinalizer)
-			patch := client.MergeFrom(original)
-			return r.Patch(ctx, latestEmuNet, patch)
-		}
-		return nil
-	})
-}
-
-func (r *EmuNetReconciler) getPodListOptions(emunet *emunetv1.EmuNet) []client.ListOption {
-	var listOptions []client.ListOption
-	listOptions = append(listOptions, client.InNamespace(emunet.Namespace))
-	if emunet.Spec.Selector != nil {
-		if selector, err := metav1.LabelSelectorAsSelector(emunet.Spec.Selector); err == nil {
-			listOptions = append(listOptions, client.MatchingLabelsSelector{Selector: selector})
-		} else {
-			// Fallback to using default label if selector conversion fails
-			listOptions = append(listOptions, client.MatchingLabels{EmuNetLabelKey: emunet.Name})
-		}
-	} else {
-		listOptions = append(listOptions, client.MatchingLabels{EmuNetLabelKey: emunet.Name})
-	}
-	return listOptions
-}
-
-// updateExistingPod updates an existing pod's image if it doesn't match the desired image
-func (r *EmuNetReconciler) updateExistingPod(ctx context.Context, emunet *emunetv1.EmuNet, pod *corev1.Pod, desiredImage string) error {
-	if pod.Spec.Containers[0].Image != desiredImage {
-		if pod.Status.Phase == corev1.PodRunning || pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
-			return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-				latestPod := &corev1.Pod{}
-				if err := r.Get(ctx, types.NamespacedName{Name: pod.Name, Namespace: emunet.Namespace}, latestPod); err != nil {
-					return err
-				}
-				if len(latestPod.Spec.Containers) == 0 {
-					return fmt.Errorf("pod has no containers")
-				}
-				original := latestPod.DeepCopy()
-				latestPod.Spec.Containers[0].Image = desiredImage
-				patch := client.MergeFrom(original)
-				return r.Patch(ctx, latestPod, patch)
-			})
-		}
-	}
-	return nil
-}
-
-// createNewPod creates a new pod based on the provided image group and index
-func (r *EmuNetReconciler) createNewPod(ctx context.Context, emunet *emunetv1.EmuNet, groupIdx int, podIdx int32, imageGroup emunetv1.ImageGroup) error {
-	podName := fmt.Sprintf("%s-group%d-%d", emunet.Name, groupIdx, podIdx)
-
-	newPod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      podName,
-			Namespace: emunet.Namespace,
-			Labels: map[string]string{
-				EmuNetLabelKey:      emunet.Name,
-				EmuNetGroupLabelKey: fmt.Sprintf("group%d", groupIdx),
-			},
-		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{
-					Name:  "emunet-pod",
-					Image: imageGroup.Image,
-				},
-			},
-		},
-	}
-
-	// Add selector matchLabels to pod labels if specified
-	if emunet.Spec.Selector != nil && emunet.Spec.Selector.MatchLabels != nil {
-		for key, value := range emunet.Spec.Selector.MatchLabels {
-			newPod.Labels[key] = value
-		}
-	}
-
-	if err := ctrl.SetControllerReference(emunet, newPod, r.Scheme); err != nil {
-		return err
-	}
-
-	return r.Create(ctx, newPod)
-}
-
-func (r *EmuNetReconciler) handleDeletion(ctx context.Context, namespacedName types.NamespacedName) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
-	emunet := &emunetv1.EmuNet{}
-	if err := r.Get(ctx, namespacedName, emunet); err != nil {
-		if errors.IsNotFound(err) {
-			return ctrl.Result{}, nil
-		}
 		return ctrl.Result{}, err
-	}
-
-	pods := &corev1.PodList{}
-	listOptions := r.getPodListOptions(emunet)
-	if err := r.List(ctx, pods, listOptions...); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	for _, pod := range pods.Items {
-		if err := r.Delete(ctx, &pod); err != nil && !errors.IsNotFound(err) {
-			logger.Error(err, "failed to delete pod", "pod", pod.Name)
-			return ctrl.Result{}, err
-		}
-	}
-
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latestEmuNet := &emunetv1.EmuNet{}
-		if err := r.Get(ctx, namespacedName, latestEmuNet); err != nil {
-			if errors.IsNotFound(err) {
-				return nil
-			}
-			return err
-		}
-
-		if controllerutil.ContainsFinalizer(latestEmuNet, EmuNetFinalizer) {
-			original := latestEmuNet.DeepCopy()
-			controllerutil.RemoveFinalizer(latestEmuNet, EmuNetFinalizer)
-			patch := client.MergeFrom(original)
-			return r.Patch(ctx, latestEmuNet, patch)
-		}
-		return nil
-	}); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	if err := r.Redis.DeleteEmuNetStatus(ctx, namespacedName.Namespace, namespacedName.Name); err != nil {
-		logger.Error(err, "failed to delete emunet status from redis", "namespace", namespacedName.Namespace, "name", namespacedName.Name)
 	}
 
 	return ctrl.Result{}, nil
 }
 
-func (r *EmuNetReconciler) syncPods(ctx context.Context, namespacedName types.NamespacedName) error {
-	emunet := &emunetv1.EmuNet{}
-	if err := r.Get(ctx, namespacedName, emunet); err != nil {
-		return err
+func (r *EmuNetReconciler) syncPods(ctx context.Context, emunet *emunetv1.EmuNet) error {
+	existingPods := &corev1.PodList{}
+	listOptions := []client.ListOption{
+		client.InNamespace(emunet.Namespace),
+		client.MatchingLabels{EmuNetLabelKey: emunet.Name},
 	}
 
-	existingPods := &corev1.PodList{}
-	listOptions := r.getPodListOptions(emunet)
 	if err := r.List(ctx, existingPods, listOptions...); err != nil {
 		return err
 	}
@@ -238,26 +92,29 @@ func (r *EmuNetReconciler) syncPods(ctx context.Context, namespacedName types.Na
 
 	desiredPods := make(map[string]bool)
 
+	// Reconcile desired state
 	for groupIdx, imageGroup := range emunet.Spec.ImageGroups {
 		for podIdx := int32(0); podIdx < imageGroup.Replicas; podIdx++ {
 			podName := fmt.Sprintf("%s-group%d-%d", emunet.Name, groupIdx, podIdx)
 			desiredPods[podName] = true
 
 			if existingPod, exists := existingPodMap[podName]; exists {
-				if err := r.updateExistingPod(ctx, emunet, existingPod, imageGroup.Image); err != nil {
+				if existingPod.Spec.Containers[0].Image != imageGroup.Image {
+					if err := r.updateExistingPod(ctx, existingPod, imageGroup.Image); err != nil {
+						return err
+					}
+				}
+			} else {
+				if err := r.createNewPod(ctx, emunet, groupIdx, podIdx, imageGroup); err != nil {
 					return err
 				}
-				continue
-			}
-
-			if err := r.createNewPod(ctx, emunet, groupIdx, podIdx, imageGroup); err != nil {
-				return err
 			}
 		}
 	}
 
+	// Cleanup extraneous pods
 	for podName, pod := range existingPodMap {
-		if !desiredPods[podName] {
+		if !desiredPods[podName] && pod.DeletionTimestamp == nil {
 			if err := r.Delete(ctx, pod); err != nil && !errors.IsNotFound(err) {
 				return err
 			}
@@ -267,99 +124,101 @@ func (r *EmuNetReconciler) syncPods(ctx context.Context, namespacedName types.Na
 	return nil
 }
 
-// updateStatus updates the EmuNet status based on current pod states
-func (r *EmuNetReconciler) updateStatus(ctx context.Context, namespacedName types.NamespacedName) error {
+func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.EmuNet) error {
 	logger := log.FromContext(ctx)
 
-	retryPolicy := retry.DefaultRetry
-	retryPolicy.Steps = 20
-	retryPolicy.Duration = 200 * time.Millisecond
-	retryPolicy.Factor = 1.5
-	retryPolicy.Jitter = 0.1
-
-	var redisStatus *redis.EmuNetStatus
-	var err error
-
-	err = retry.RetryOnConflict(retryPolicy, func() error {
-		emunet := &emunetv1.EmuNet{}
-		if err := r.Get(ctx, namespacedName, emunet); err != nil {
-			logger.Error(err, "failed to get emunet")
-			return err
-		}
-
-		original := emunet.DeepCopy()
-
-		// Get current pods
-		pods := &corev1.PodList{}
-		listOptions := r.getPodListOptions(emunet)
-		if err := r.List(ctx, pods, listOptions...); err != nil {
-			logger.Error(err, "failed to list pods")
-			return err
-		}
-
-		logger.Info("found pods", "count", len(pods.Items), "namespace", emunet.Namespace, "name", emunet.Name)
-
-		// Create pod map for quick lookup
-		podMap := make(map[string]*corev1.Pod)
-		for i := range pods.Items {
-			podMap[pods.Items[i].Name] = &pods.Items[i]
-		}
-
-		// Create existing pod status map for quick lookup
-		existingPodStatusMap := make(map[string]emunetv1.PodStatus)
-		for _, group := range emunet.Status.ImageGroupStatus {
-			for _, podStatus := range group.PodStatuses {
-				existingPodStatusMap[podStatus.PodName] = podStatus
-			}
-		}
-
-		// Calculate image group status
-		imageGroupStatus, totalReady := r.calculateImageGroupStatus(ctx, emunet, podMap, existingPodStatusMap)
-
-		// Update EmuNet status
-		emunet.Status.ReadyReplicas = totalReady
-		emunet.Status.DesiredReplicas = emunet.Spec.TotalReplicas
-		emunet.Status.ImageGroupStatus = imageGroupStatus
-		emunet.Status.ObservedGen = emunet.Generation
-
-		// Patch status
-		patch := client.MergeFrom(original)
-		if err := r.Status().Patch(ctx, emunet, patch); err != nil {
-			logger.Error(err, "failed to patch emunet status")
-			return err
-		}
-
-		logger.Info("updated emunet status", "readyReplicas", totalReady, "desiredReplicas", emunet.Spec.TotalReplicas)
-
-		// Prepare redis status
-		redisStatus = &redis.EmuNetStatus{
-			Name:             emunet.Name,
-			Namespace:        emunet.Namespace,
-			ReadyReplicas:    totalReady,
-			DesiredReplicas:  emunet.Spec.TotalReplicas,
-			ObservedGen:      emunet.Generation,
-			ImageGroupStatus: convertImageGroupStatus(emunet.Status.ImageGroupStatus),
-			LastUpdated:      time.Now(),
-		}
-
-		return nil
-	})
-
-	if err != nil {
+	// Fetch latest pods
+	pods := &corev1.PodList{}
+	listOptions := []client.ListOption{
+		client.InNamespace(emunet.Namespace),
+		client.MatchingLabels{EmuNetLabelKey: emunet.Name},
+	}
+	if err := r.List(ctx, pods, listOptions...); err != nil {
 		return err
 	}
 
-	// Save status to redis
+	// Calculate Status
+	podMap := make(map[string]*corev1.Pod, len(pods.Items))
+	for i := range pods.Items {
+		podMap[pods.Items[i].Name] = &pods.Items[i]
+	}
+
+	// Reuse existing MAC/IfIndex info from previous status if available
+	// This helps in case Redis read fails temporarily
+	existingPodStatusMap := make(map[string]emunetv1.PodStatus)
+	for _, group := range emunet.Status.ImageGroupStatus {
+		for _, podStatus := range group.PodStatuses {
+			existingPodStatusMap[podStatus.PodName] = podStatus
+		}
+	}
+
+	// [关键变更] 这里会去 Redis 拉取 Agent 上报的数据
+	imageGroupStatus, totalReady := r.calculateImageGroupStatus(ctx, emunet, podMap, existingPodStatusMap)
+
+	// 1. Update K8s Status (Optimistic Locking via Patch)
+	newStatus := emunet.Status.DeepCopy()
+	newStatus.ReadyReplicas = totalReady
+	newStatus.DesiredReplicas = emunet.Spec.TotalReplicas
+	newStatus.ImageGroupStatus = imageGroupStatus
+	newStatus.ObservedGen = emunet.Generation
+
+	if !equality.Semantic.DeepEqual(emunet.Status, *newStatus) {
+		patch := client.MergeFrom(emunet.DeepCopy())
+		emunet.Status = *newStatus
+		if err := r.Status().Patch(ctx, emunet, patch); err != nil {
+			return err
+		}
+	}
+
+	// 2. Update Redis (Using Batch Pipeline)
+	// Master 将 K8s 中的权威信息 (IP, Node) 合并后反写回 Redis，
+	// 确保 Redis 中既有 Agent 上报的 MAC，又有 K8s 分配的 IP。
+	redisStatus := &redis.EmuNetStatus{
+		Name:             emunet.Name,
+		Namespace:        emunet.Namespace,
+		ReadyReplicas:    totalReady,
+		DesiredReplicas:  emunet.Spec.TotalReplicas,
+		ObservedGen:      emunet.Generation,
+		ImageGroupStatus: convertImageGroupStatus(imageGroupStatus),
+		LastUpdated:      time.Now(),
+	}
+
+	// Call the batch save method
 	if err := r.saveStatusToRedis(ctx, redisStatus); err != nil {
-		return err
+		logger.Error(err, "failed to update redis cache")
+		// We don't return error to avoid crash looping K8s reconciliation due to Redis issues
 	}
 
 	return nil
 }
 
-// calculateImageGroupStatus calculates the status for each image group
-func (r *EmuNetReconciler) calculateImageGroupStatus(ctx context.Context, emunet *emunetv1.EmuNet, podMap map[string]*corev1.Pod, existingPodStatusMap map[string]emunetv1.PodStatus) ([]emunetv1.ImageGroupStatus, int32) {
-	logger := log.FromContext(ctx)
+func (r *EmuNetReconciler) saveStatusToRedis(ctx context.Context, status *redis.EmuNetStatus) error {
+	var allPods []redis.PodStatus
+	for _, group := range status.ImageGroupStatus {
+		for _, pod := range group.PodStatuses {
+			allPods = append(allPods, pod)
+		}
+	}
+	return r.Redis.SaveStatusBatch(ctx, status, allPods)
+}
+
+func (r *EmuNetReconciler) handleDeletion(ctx context.Context, nn types.NamespacedName, emunet *emunetv1.EmuNet) (ctrl.Result, error) {
+	if err := r.Redis.DeleteEmuNetStatus(ctx, nn.Namespace, nn.Name); err != nil {
+		log.FromContext(ctx).Error(err, "failed to cleanup redis status")
+	}
+
+	controllerutil.RemoveFinalizer(emunet, EmuNetFinalizer)
+	if err := r.Update(ctx, emunet); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// --- Helpers ---
+
+// [核心逻辑] 合并 K8s Pod 状态与 Redis Agent 数据
+func (r *EmuNetReconciler) calculateImageGroupStatus(ctx context.Context, emunet *emunetv1.EmuNet, podMap map[string]*corev1.Pod, existingStatus map[string]emunetv1.PodStatus) ([]emunetv1.ImageGroupStatus, int32) {
 	var imageGroupStatus []emunetv1.ImageGroupStatus
 	var totalReady int32
 
@@ -367,87 +226,109 @@ func (r *EmuNetReconciler) calculateImageGroupStatus(ctx context.Context, emunet
 		groupStatus := emunetv1.ImageGroupStatus{
 			Image:           imageGroup.Image,
 			DesiredReplicas: imageGroup.Replicas,
-			PodStatuses:     []emunetv1.PodStatus{},
+			PodStatuses:     make([]emunetv1.PodStatus, 0, imageGroup.Replicas),
 		}
 
 		for podIdx := int32(0); podIdx < imageGroup.Replicas; podIdx++ {
 			podName := fmt.Sprintf("%s-group%d-%d", emunet.Name, groupIdx, podIdx)
+
 			podStatus := emunetv1.PodStatus{
 				PodName:     podName,
 				Image:       imageGroup.Image,
-				MACAddress:  "",
-				NodeName:    "",
-				VethIfIndex: 0,
 				Phase:       corev1.PodPending,
 				Ready:       false,
 				LastUpdated: metav1.Now(),
 			}
 
+			// 1. 继承旧状态 (防止 flickering)
+			if old, ok := existingStatus[podName]; ok {
+				podStatus.MACAddress = old.MACAddress
+				podStatus.VethIfIndex = old.VethIfIndex
+			}
+
+			// 2. 更新 K8s 实时状态
 			if pod, exists := podMap[podName]; exists {
 				podStatus.Phase = pod.Status.Phase
 				podStatus.PodIP = pod.Status.PodIP
 				podStatus.NodeName = pod.Spec.NodeName
-				podStatus.Ready = podReady(pod)
-				podStatus.Message = podStatusMessage(pod)
+				podStatus.Ready = isPodReady(pod)
+				podStatus.Message = getPodMessage(pod)
 
-				if existingPodStatus, exists := existingPodStatusMap[podName]; exists {
-					podStatus.MACAddress = existingPodStatus.MACAddress
-					podStatus.VethIfIndex = existingPodStatus.VethIfIndex
-				}
-
-				logger.Info("pod status", "podName", podName, "phase", podStatus.Phase, "ready", podStatus.Ready, "macAddress", podStatus.MACAddress, "vethIfIndex", podStatus.VethIfIndex)
-
-				if podStatus.Ready {
-					groupStatus.ReadyReplicas++
-					totalReady++
+				// 3. [关键步骤] 如果 Pod 正在运行，尝试从 Redis 补全网络信息
+				if podStatus.Phase == corev1.PodRunning {
+					// 尝试从 Redis 直接读取 (O(1) 查找) Agent 上报的数据
+					// 注意：GetPodInfoDirectly 返回的是 Agent 写入的简版数据 (仅含 MAC/Index)
+					redisInfo, err := r.Redis.GetPodInfoDirectly(ctx, podName)
+					if err == nil && redisInfo != nil {
+						// 只有当 Redis 里有新数据时才覆盖
+						if redisInfo.MACAddress != "" {
+							podStatus.MACAddress = redisInfo.MACAddress
+						}
+						// 0 通常是无效 index
+						if redisInfo.VethIfIndex != 0 {
+							podStatus.VethIfIndex = redisInfo.VethIfIndex
+						}
+					}
 				}
 			}
 
+			if podStatus.Ready {
+				groupStatus.ReadyReplicas++
+				totalReady++
+			}
 			groupStatus.PodStatuses = append(groupStatus.PodStatuses, podStatus)
 		}
-
 		imageGroupStatus = append(imageGroupStatus, groupStatus)
 	}
-
 	return imageGroupStatus, totalReady
 }
 
-// saveStatusToRedis saves the EmuNet status to redis
-func (r *EmuNetReconciler) saveStatusToRedis(ctx context.Context, status *redis.EmuNetStatus) error {
-	logger := log.FromContext(ctx)
+func (r *EmuNetReconciler) updateExistingPod(ctx context.Context, pod *corev1.Pod, desiredImage string) error {
+	patch := client.MergeFrom(pod.DeepCopy())
+	pod.Spec.Containers[0].Image = desiredImage
+	return r.Patch(ctx, pod, patch)
+}
 
-	if err := r.Redis.SaveEmuNetStatus(ctx, status); err != nil {
-		logger.Error(err, "failed to save emunet status to redis")
-		return err
+func (r *EmuNetReconciler) createNewPod(ctx context.Context, emunet *emunetv1.EmuNet, groupIdx int, podIdx int32, imageGroup emunetv1.ImageGroup) error {
+	podName := fmt.Sprintf("%s-group%d-%d", emunet.Name, groupIdx, podIdx)
+	newPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: emunet.Namespace,
+			Labels: map[string]string{
+				EmuNetLabelKey:      emunet.Name,
+				EmuNetGroupLabelKey: fmt.Sprintf("group%d", groupIdx),
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:  "emunet-pod",
+				Image: imageGroup.Image,
+			}},
+		},
 	}
 
-	logger.Info("saved emunet status to redis", "name", status.Name, "namespace", status.Namespace)
-
-	for _, group := range status.ImageGroupStatus {
-		for _, pod := range group.PodStatuses {
-			redisPod := pod
-			if err := r.Redis.SavePodStatus(ctx, status.Namespace, status.Name, &redisPod); err != nil {
-				logger.Error(err, "failed to save pod status to redis", "podName", redisPod.PodName)
-				return err
-			}
+	if emunet.Spec.Selector != nil {
+		for k, v := range emunet.Spec.Selector.MatchLabels {
+			newPod.Labels[k] = v
 		}
 	}
 
-	logger.Info("saved all pod statuses to redis", "count", len(status.ImageGroupStatus))
-
-	return nil
+	if err := ctrl.SetControllerReference(emunet, newPod, r.Scheme); err != nil {
+		return err
+	}
+	return r.Create(ctx, newPod)
 }
 
 func convertImageGroupStatus(k8sStatus []emunetv1.ImageGroupStatus) []redis.ImageGroupStatus {
 	var redisStatus []redis.ImageGroupStatus
 	for _, k8sGroup := range k8sStatus {
-		group := redis.ImageGroupStatus{
+		redisStatus = append(redisStatus, redis.ImageGroupStatus{
 			Image:           k8sGroup.Image,
 			DesiredReplicas: k8sGroup.DesiredReplicas,
 			ReadyReplicas:   k8sGroup.ReadyReplicas,
 			PodStatuses:     convertPodStatuses(k8sGroup.PodStatuses),
-		}
-		redisStatus = append(redisStatus, group)
+		})
 	}
 	return redisStatus
 }
@@ -455,7 +336,7 @@ func convertImageGroupStatus(k8sStatus []emunetv1.ImageGroupStatus) []redis.Imag
 func convertPodStatuses(k8sPods []emunetv1.PodStatus) []redis.PodStatus {
 	var redisPods []redis.PodStatus
 	for _, k8sPod := range k8sPods {
-		pod := redis.PodStatus{
+		redisPods = append(redisPods, redis.PodStatus{
 			PodName:     k8sPod.PodName,
 			Image:       k8sPod.Image,
 			PodIP:       k8sPod.PodIP,
@@ -466,13 +347,12 @@ func convertPodStatuses(k8sPods []emunetv1.PodStatus) []redis.PodStatus {
 			MACAddress:  k8sPod.MACAddress,
 			VethIfIndex: k8sPod.VethIfIndex,
 			LastUpdated: k8sPod.LastUpdated.Time,
-		}
-		redisPods = append(redisPods, pod)
+		})
 	}
 	return redisPods
 }
 
-func podReady(pod *corev1.Pod) bool {
+func isPodReady(pod *corev1.Pod) bool {
 	for _, condition := range pod.Status.Conditions {
 		if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
 			return true
@@ -481,7 +361,7 @@ func podReady(pod *corev1.Pod) bool {
 	return false
 }
 
-func podStatusMessage(pod *corev1.Pod) string {
+func getPodMessage(pod *corev1.Pod) string {
 	for _, condition := range pod.Status.Conditions {
 		if condition.Type == corev1.PodReady {
 			return condition.Message
@@ -493,6 +373,6 @@ func podStatusMessage(pod *corev1.Pod) string {
 func (r *EmuNetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&emunetv1.EmuNet{}).
-		Named("emunet").
+		Owns(&corev1.Pod{}).
 		Complete(r)
 }
