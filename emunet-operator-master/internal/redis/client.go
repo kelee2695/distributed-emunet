@@ -74,10 +74,50 @@ func (c *Client) Close() error {
 }
 
 // ==========================================
+// Agent Operations (Targeted Updates)
+// ==========================================
+
+// UpdatePodNetworkInfo [核心修改] Agent 写入专用的 Key，防止被 Master 覆盖
+// Agent 写入: agent:network:{podName}
+func (c *Client) UpdatePodNetworkInfo(ctx context.Context, podName string, mac string, ifIndex int) error {
+	pod := PodStatus{
+		PodName:     podName,
+		MACAddress:  mac,
+		VethIfIndex: ifIndex,
+		LastUpdated: time.Now(),
+	}
+
+	data, err := json.Marshal(pod)
+	if err != nil {
+		return err
+	}
+
+	// 使用专用前缀 "agent:network:"
+	key := fmt.Sprintf("agent:network:%s", podName)
+	return c.client.Set(ctx, key, data, DefaultTTL).Err()
+}
+
+// GetAgentNetworkInfo [新增] Master 从专用 Key 读取 Agent 上报的数据
+func (c *Client) GetAgentNetworkInfo(ctx context.Context, podName string) (*PodStatus, error) {
+	key := fmt.Sprintf("agent:network:%s", podName)
+	data, err := c.client.Get(ctx, key).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	var pod PodStatus
+	if err := json.Unmarshal([]byte(data), &pod); err != nil {
+		return nil, err
+	}
+	return &pod, nil
+}
+
+// ==========================================
 // Master Operations (Batch & Hierarchy)
 // ==========================================
 
 // SaveStatusBatch uses Redis Pipeline to save everything in 1 RTT.
+// Master 写入: pod_lookup:{podName} (这是合并了 IP 和 MAC 的完整数据)
 func (c *Client) SaveStatusBatch(ctx context.Context, emunet *EmuNetStatus, pods []PodStatus) error {
 	pipe := c.client.Pipeline()
 
@@ -103,6 +143,7 @@ func (c *Client) SaveStatusBatch(ctx context.Context, emunet *EmuNetStatus, pods
 		pipe.Set(ctx, podKey, podData, DefaultTTL)
 
 		// B. Lookup Key (pod_lookup:podname) - Enables O(1) global lookup
+		// API Server 读取这个 Key
 		if pod.PodName != "" {
 			lookupKey := fmt.Sprintf("pod_lookup:%s", pod.PodName)
 			pipe.Set(ctx, lookupKey, podData, DefaultTTL)
@@ -154,6 +195,8 @@ func (c *Client) DeleteEmuNetStatus(ctx context.Context, namespace, name string)
 	for _, podName := range podNames {
 		pipe.Del(ctx, fmt.Sprintf("emunet:%s:%s:pod:%s", namespace, name, podName))
 		pipe.Del(ctx, fmt.Sprintf("pod_lookup:%s", podName))
+		// Optional: We can also cleanup agent data, but TTL handles it usually
+		pipe.Del(ctx, fmt.Sprintf("agent:network:%s", podName))
 	}
 
 	// 3. Delete EmuNet keys
@@ -166,35 +209,11 @@ func (c *Client) DeleteEmuNetStatus(ctx context.Context, namespace, name string)
 }
 
 // ==========================================
-// Agent Operations (Targeted Updates)
-// ==========================================
-
-// UpdatePodNetworkInfo is specifically designed for Agents.
-// It only updates the "pod_lookup:{podName}" key with MAC/IfIndex.
-// This is the O(1) write operation for the Agent side.
-func (c *Client) UpdatePodNetworkInfo(ctx context.Context, podName string, mac string, ifIndex int) error {
-	// Construct minimal pod status
-	pod := PodStatus{
-		PodName:     podName,
-		MACAddress:  mac,
-		VethIfIndex: ifIndex,
-		LastUpdated: time.Now(),
-	}
-
-	data, err := json.Marshal(pod)
-	if err != nil {
-		return err
-	}
-
-	// Agent only writes to lookup key. Master reads this and merges it.
-	return c.client.Set(ctx, fmt.Sprintf("pod_lookup:%s", podName), data, DefaultTTL).Err()
-}
-
-// ==========================================
 // Shared Operations
 // ==========================================
 
 // GetPodInfoDirectly is the O(1) lookup method for the Master API
+// It reads from "pod_lookup:{podName}" which contains merged data
 func (c *Client) GetPodInfoDirectly(ctx context.Context, podName string) (*PodStatus, error) {
 	key := fmt.Sprintf("pod_lookup:%s", podName)
 	data, err := c.client.Get(ctx, key).Result()

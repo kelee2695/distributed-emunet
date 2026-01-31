@@ -78,9 +78,6 @@ func (r *EmuNetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	// 3. 智能轮询 (Smart Polling)
-	// 核心逻辑：Agent 写入 Redis 不会触发 K8s 事件，所以 Master 必须主动轮询 Redis。
-	// 如果所有 Pod 都 Ready 了，我们降低轮询频率到 30s。
-	// 如果还有 Pod 没 Ready（或者 MAC 还没上报），我们保持 3s 高频轮询。
 	if isReady {
 		return ctrl.Result{RequeueAfter: SyncPeriodSlow}, nil
 	}
@@ -186,8 +183,7 @@ func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.Em
 	}
 
 	// 2. Update Redis
-	// 将合并了 (Agent MAC) + (K8s IP) 的完整信息写回 Redis
-	// 这样 Master Server 就能通过 GetPodInfoDirectly 查到包含 IP 的完整信息
+	// 将合并了 (Agent MAC) + (K8s IP) 的完整信息写回 Redis (写到 pod_lookup)
 	redisStatus := &redis.EmuNetStatus{
 		Name:             emunet.Name,
 		Namespace:        emunet.Namespace,
@@ -202,7 +198,7 @@ func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.Em
 		logger.Error(err, "failed to update redis cache")
 	}
 
-	// 判断系统是否完全就绪：Pod 数量够了 && 所有 Pod 的 MAC 地址都拿到了
+	// 判断系统是否完全就绪
 	isFullyReady := (totalReady == emunet.Spec.TotalReplicas) && allMacsFound
 	return isFullyReady, nil
 }
@@ -236,7 +232,7 @@ func (r *EmuNetReconciler) handleDeletion(ctx context.Context, nn types.Namespac
 func (r *EmuNetReconciler) calculateImageGroupStatus(ctx context.Context, emunet *emunetv1.EmuNet, podMap map[string]*corev1.Pod, existingStatus map[string]emunetv1.PodStatus) ([]emunetv1.ImageGroupStatus, int32, bool) {
 	var imageGroupStatus []emunetv1.ImageGroupStatus
 	var totalReady int32
-	allMacsFound := true // 假设所有 MAC 都找到了，除非发现没有
+	allMacsFound := true
 
 	for groupIdx, imageGroup := range emunet.Spec.ImageGroups {
 		groupStatus := emunetv1.ImageGroupStatus{
@@ -270,9 +266,9 @@ func (r *EmuNetReconciler) calculateImageGroupStatus(ctx context.Context, emunet
 				podStatus.Ready = isPodReady(pod)
 				podStatus.Message = getPodMessage(pod)
 
-				// 3. 尝试从 Redis 读取 MAC/IfIndex
-				// 不论 Pod 状态如何，只要 Redis 有数据我们就读，防止 Pod 刚重启时状态不稳但 Redis 有数据的情况
-				redisInfo, err := r.Redis.GetPodInfoDirectly(ctx, podName)
+				// 3. [核心修改] 尝试从 Agent 专用 Key 读取 MAC/IfIndex
+				// 使用 GetAgentNetworkInfo (agent:network:...)
+				redisInfo, err := r.Redis.GetAgentNetworkInfo(ctx, podName)
 				if err == nil && redisInfo != nil {
 					if redisInfo.MACAddress != "" {
 						podStatus.MACAddress = redisInfo.MACAddress
