@@ -27,4 +27,4 @@ build: fmt vet ## Build manager binary.
 
 .PHONY: run
 run: fmt vet ## Run manager from host.
-	go run ./cmd/main.go
+	go run ./cmd/main.go -redis-addr="100.75.179.29:6379"
