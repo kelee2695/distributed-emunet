@@ -78,22 +78,30 @@ func NewMasterServer(client client.Client, redisClient *redis.Client) *MasterSer
 		client: client,
 		redis:  redisClient,
 		router: mux.NewRouter(),
-		// 任务队列容量：防止瞬间流量洪峰导致阻塞
-		jobQueue: make(chan AgentJob, 50000),
-		// 优化 HTTP 连接配置
+
+		// [优化1] 任务队列容量：5w -> 100w
+		// 应对突发流量洪峰（如 Churn 模式），防止队列瞬间填满导致 503 Service Unavailable
+		jobQueue: make(chan AgentJob, 1000000),
+
+		// [优化2] 极致的 HTTP 连接池配置
 		httpClient: &http.Client{
-			Timeout: 5 * time.Second,
+			Timeout: 5 * time.Second, // 短超时，快速失败
 			Transport: &http.Transport{
-				MaxIdleConns:        1000,
-				MaxIdleConnsPerHost: 100, // 关键：允许对每个 Agent 保持 100 个长连接
+				// 允许系统保留 2000 个空闲连接 (匹配 Worker 数量)
+				MaxIdleConns: 2000,
+				// 允许对每个 Agent (Node) 保留 500 个长连接 (应对密集型部署)
+				MaxIdleConnsPerHost: 500,
 				IdleConnTimeout:     90 * time.Second,
 				DisableKeepAlives:   false,
 			},
 		},
 	}
 
-	// 启动 50 个后台 Worker 协程处理网络请求
-	s.startWorkers(50)
+	// [优化3] Worker 扩容：50 -> 1000
+	// 启动 1000 个后台 Worker 协程，确保出队速度 > 入队速度
+	// Go 协程非常廉价，1000 个协程对 Master 资源消耗极低，但能带来巨大的吞吐量提升
+	s.startWorkers(1000)
+
 	s.setupRoutes()
 	return s
 }
@@ -122,7 +130,8 @@ func (s *MasterServer) sendToAgent(job AgentJob) {
 	// 复用连接发送请求
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		// 生产环境建议：记录 Metrics 或加入重试队列
+		// 生产环境建议：记录 Metrics (Prometheus) 或写入死信队列
+		// 在高频压测下，打印日志可能会拖慢 IO，建议仅在 Debug 模式开启
 		// fmt.Printf("Failed to send to agent %s: %v\n", job.TargetNodeIP, err)
 		return
 	}
@@ -134,7 +143,7 @@ func (s *MasterServer) sendToAgent(job AgentJob) {
 func (s *MasterServer) setupRoutes() {
 	api := s.router.PathPrefix("/api/v1").Subrouter()
 
-	// 查询接口 (保留原有逻辑，这里略去实现细节以聚焦核心)
+	// 查询接口
 	api.HandleFunc("/emunets", s.listEmuNets).Methods("GET")
 	api.HandleFunc("/emunets/{namespace}/{name}", s.getEmuNet).Methods("GET")
 	api.HandleFunc("/emunets/{namespace}/{name}/status", s.getEmuNetStatus).Methods("GET")
@@ -281,6 +290,22 @@ func (s *MasterServer) handleEBPFEntryDeleteByPods(w http.ResponseWriter, r *htt
 	})
 }
 
+func (s *MasterServer) listPods(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	ns := vars["namespace"]
+	name := vars["name"]
+
+	// 使用 Redis 的 ListPodStatuses (它会从 Redis Set 中读取)
+	// 这是一个优化过的操作
+	pods, err := s.redis.ListPodStatuses(r.Context(), ns, name)
+	if err != nil {
+		s.sendError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	s.sendSuccess(w, pods)
+}
+
 // --- 辅助函数 ---
 
 func (s *MasterServer) sendSuccess(w http.ResponseWriter, data interface{}) {
@@ -303,9 +328,6 @@ func (s *MasterServer) getEmuNet(w http.ResponseWriter, r *http.Request) {
 	s.sendSuccess(w, "impl pending")
 }
 func (s *MasterServer) getEmuNetStatus(w http.ResponseWriter, r *http.Request) {
-	s.sendSuccess(w, "impl pending")
-}
-func (s *MasterServer) listPods(w http.ResponseWriter, r *http.Request) {
 	s.sendSuccess(w, "impl pending")
 }
 func (s *MasterServer) getPod(w http.ResponseWriter, r *http.Request) {
