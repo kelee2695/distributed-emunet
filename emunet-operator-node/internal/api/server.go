@@ -3,11 +3,11 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
-	"fmt"
 
 	"github.com/cilium/ebpf"
 	"github.com/gorilla/mux"
@@ -196,48 +196,48 @@ func (s *AgentServer) handleEBPFEntry(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *AgentServer) handlePodInfoAdd(w http.ResponseWriter, r *http.Request) {
-    s.recordRequestStart()
+	s.recordRequestStart()
 
-    var req struct {
-        PodName string `json:"podName"`
-        Ifindex int    `json:"ifindex"`
-        SrcMac  string `json:"srcMac"`
-    }
+	var req struct {
+		PodName string `json:"podName"`
+		Ifindex int    `json:"ifindex"`
+		SrcMac  string `json:"srcMac"`
+	}
 
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-        s.recordRequestEnd(false, false)
-        http.Error(w, err.Error(), http.StatusBadRequest)
-        return
-    }
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.recordRequestEnd(false, false)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
-    // 1. 存入本地内存 Store
-    info := &PodInfo{
-        PodName: req.PodName,
-        Ifindex: req.Ifindex,
-        SrcMac:  req.SrcMac,
-    }
-    s.podInfoStore.Set(req.PodName, info)
+	// 1. 存入本地内存 Store
+	info := &PodInfo{
+		PodName: req.PodName,
+		Ifindex: req.Ifindex,
+		SrcMac:  req.SrcMac,
+	}
+	s.podInfoStore.Set(req.PodName, info)
 
-    // 2. 异步写入 Redis (增加调试日志!!!)
-    go func(name, mac string, idx int) {
-        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-        defer cancel()
-        
-        // --- 修改开始 ---
-        err := s.redis.UpdatePodNetworkInfo(ctx, name, mac, idx)
-        if err != nil {
-            // 这里会打印具体的错误原因，例如 DNS 解析失败、连接超时等
-            fmt.Printf("[ERROR] Failed to update Redis for pod %s: %v\n", name, err)
-        } else {
-            fmt.Printf("[DEBUG] Successfully wrote to Redis: lookup:%s -> %s\n", name, mac)
-        }
-        // --- 修改结束 ---
-        
-    }(req.PodName, req.SrcMac, req.Ifindex)
+	// 2. 异步写入 Redis (增加调试日志!!!)
+	go func(name, mac string, idx int) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-    s.recordRequestEnd(true, false)
-    w.WriteHeader(http.StatusOK)
-    w.Write([]byte(`{"status":"success"}`))
+		// --- 修改开始 ---
+		err := s.redis.UpdatePodNetworkInfo(ctx, name, mac, idx)
+		if err != nil {
+			// 这里会打印具体的错误原因，例如 DNS 解析失败、连接超时等
+			fmt.Printf("[ERROR] Failed to update Redis for pod %s: %v\n", name, err)
+		} else {
+			fmt.Printf("[DEBUG] Successfully wrote to Redis: lookup:%s -> %s\n", name, mac)
+		}
+		// --- 修改结束 ---
+
+	}(req.PodName, req.SrcMac, req.Ifindex)
+
+	s.recordRequestEnd(true, false)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"success"}`))
 }
 
 func (s *AgentServer) handlePodInfo(w http.ResponseWriter, r *http.Request) {
