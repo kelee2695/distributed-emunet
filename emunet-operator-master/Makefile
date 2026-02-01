@@ -43,12 +43,25 @@ vet: ## Run go vet against code.
 ##@ Build
 
 .PHONY: build
-build: generate fmt vet ## Build manager binary.
-	go build -o bin/manager cmd/main.go
+build: generate fmt vet ## Build all binaries (controller and apiserver).
+	@echo "Building controller..."
+	go build -o bin/controller cmd/controller/main.go
+	@echo "Building apiserver..."
+	go build -o bin/apiserver cmd/apiserver/main.go
 
+# 运行 Controller (通常需要连接 K8s 集群)
+.PHONY: run-controller
+run-controller: generate fmt vet ## Run the controller from your host.
+	go run ./cmd/controller/controller_main.go
+
+# 运行 API Server (通常需要连接 Redis)
+.PHONY: run-apiserver
+run-apiserver: fmt vet ## Run the apiserver from your host.
+	go run ./cmd/apiserver/apiserver_main.go
+
+# 默认 make run 运行控制器，保持向后兼容
 .PHONY: run
-run: generate fmt vet ## Run a controller from your host.
-	go run ./cmd/main.go
+run: run-controller ## Run the controller from your host (alias for run-controller).
 
 ##@ Dependencies
 
@@ -61,7 +74,7 @@ $(LOCALBIN):
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 
 ## Tool Versions
-CONTROLLER_TOOLS_VERSION ?= v0.19.0
+CONTROLLER_TOOLS_VERSION ?= v0.16.0
 
 .PHONY: controller-gen
 controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.

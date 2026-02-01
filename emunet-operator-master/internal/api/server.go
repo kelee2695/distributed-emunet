@@ -2,21 +2,29 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	"go.uber.org/zap"
 
 	"github.com/emunet/emunet-operator/internal/redis"
 )
 
 const (
-	AgentPort = 12345 // Agent 监听端口
+	AgentPort    = 12345   // Agent 监听端口
+	JobQueueSize = 1000000 // 任务队列缓冲区大小
+	WorkerCount  = 1000    // 并发 Worker 数量
 )
+
+// =================================================================================
+// 1. 数据结构定义 (Types)
+// =================================================================================
 
 // AgentJob 定义发送给 Agent 的异步任务
 type AgentJob struct {
@@ -25,18 +33,7 @@ type AgentJob struct {
 	Payload      []byte
 }
 
-type MasterServer struct {
-	client client.Client // K8s Client (用于 List EmuNets 等非高频操作)
-	redis  *redis.Client // Redis Client (用于高频 O(1) 查找)
-	router *mux.Router
-
-	// 优化1: 全局 HTTP Client (连接池)
-	httpClient *http.Client
-	// 优化2: 异步任务队列
-	jobQueue chan AgentJob
-}
-
-// Request/Response 结构体
+// Request/Response DTOs
 type EBPFEntryByPodsRequest struct {
 	Pod1            string `json:"pod1"`
 	Pod2            string `json:"pod2"`
@@ -51,19 +48,13 @@ type EBPFEntryDeleteByPodsRequest struct {
 	Pod2 string `json:"pod2"`
 }
 
-// 发送给 Agent 的底层请求结构
-type EBPFEntryRequest struct {
+type AgentRequest struct {
 	Ifindex         uint32 `json:"ifindex"`
 	SrcMac          string `json:"srcMac"`
-	ThrottleRateBps uint32 `json:"throttleRateBps"`
-	Delay           uint32 `json:"delay"`
-	LossRate        uint32 `json:"lossRate"`
-	Jitter          uint32 `json:"jitter"`
-}
-
-type EBPFEntryDeleteRequest struct {
-	Ifindex uint32 `json:"ifindex"`
-	SrcMac  string `json:"srcMac"`
+	ThrottleRateBps uint32 `json:"throttleRateBps,omitempty"`
+	Delay           uint32 `json:"delay,omitempty"`
+	LossRate        uint32 `json:"lossRate,omitempty"`
+	Jitter          uint32 `json:"jitter,omitempty"`
 }
 
 type Response struct {
@@ -72,103 +63,143 @@ type Response struct {
 	Error   string      `json:"error,omitempty"`
 }
 
-// NewMasterServer 初始化 Master Server
-func NewMasterServer(client client.Client, redisClient *redis.Client) *MasterServer {
+// =================================================================================
+// 2. Server 核心与生命周期 (Core & Lifecycle)
+// =================================================================================
+
+type MasterServer struct {
+	redis      *redis.Client
+	router     *mux.Router
+	logger     *zap.Logger
+	httpClient *http.Client
+
+	// 异步任务系统
+	jobQueue chan AgentJob
+	wg       sync.WaitGroup // 用于优雅退出等待
+	ctx      context.Context
+	cancel   context.CancelFunc
+}
+
+// NewMasterServer 初始化
+func NewMasterServer(redisClient *redis.Client, logger *zap.Logger) *MasterServer {
+	ctx, cancel := context.WithCancel(context.Background())
+
 	s := &MasterServer{
-		client: client,
 		redis:  redisClient,
+		logger: logger,
 		router: mux.NewRouter(),
+		ctx:    ctx,
+		cancel: cancel,
 
-		// [优化1] 任务队列容量：5w -> 100w
-		// 应对突发流量洪峰（如 Churn 模式），防止队列瞬间填满导致 503 Service Unavailable
-		jobQueue: make(chan AgentJob, 1000000),
+		// 缓冲队列：应对 Churn 模式下的突发流量
+		jobQueue: make(chan AgentJob, JobQueueSize),
 
-		// [优化2] 极致的 HTTP 连接池配置
+		// 极致优化的 HTTP Client
 		httpClient: &http.Client{
-			Timeout: 5 * time.Second, // 短超时，快速失败
+			Timeout: 5 * time.Second, // 快速失败原则
 			Transport: &http.Transport{
-				// 允许系统保留 2000 个空闲连接 (匹配 Worker 数量)
-				MaxIdleConns: 2000,
-				// 允许对每个 Agent (Node) 保留 500 个长连接 (应对密集型部署)
-				MaxIdleConnsPerHost: 500,
+				MaxIdleConns:        WorkerCount * 2, // 匹配 Worker 数量
+				MaxIdleConnsPerHost: 100,             // 单个 Node 的最大连接数
 				IdleConnTimeout:     90 * time.Second,
 				DisableKeepAlives:   false,
 			},
 		},
 	}
 
-	// [优化3] Worker 扩容：50 -> 1000
-	// 启动 1000 个后台 Worker 协程，确保出队速度 > 入队速度
-	// Go 协程非常廉价，1000 个协程对 Master 资源消耗极低，但能带来巨大的吞吐量提升
-	s.startWorkers(1000)
-
+	// 启动路由和后台进程
 	s.setupRoutes()
+	s.startWorkers()
+
 	return s
 }
 
-func (s *MasterServer) startWorkers(count int) {
-	for i := 0; i < count; i++ {
-		go func() {
-			for job := range s.jobQueue {
-				s.sendToAgent(job)
-			}
-		}()
-	}
-}
-
-// 实际发送逻辑 (Worker 执行)
-func (s *MasterServer) sendToAgent(job AgentJob) {
-	// 构造 Agent URL
-	url := fmt.Sprintf("http://%s:%d/api/ebpf/entry", job.TargetNodeIP, AgentPort)
-
-	req, err := http.NewRequest(job.Method, url, bytes.NewBuffer(job.Payload))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	// 复用连接发送请求
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		// 生产环境建议：记录 Metrics (Prometheus) 或写入死信队列
-		// 在高频压测下，打印日志可能会拖慢 IO，建议仅在 Debug 模式开启
-		// fmt.Printf("Failed to send to agent %s: %v\n", job.TargetNodeIP, err)
-		return
-	}
-	// 必须读取 Body 并 Close，否则无法复用 TCP 连接
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-}
-
-func (s *MasterServer) setupRoutes() {
-	api := s.router.PathPrefix("/api/v1").Subrouter()
-
-	// 查询接口
-	api.HandleFunc("/emunets", s.listEmuNets).Methods("GET")
-	api.HandleFunc("/emunets/{namespace}/{name}", s.getEmuNet).Methods("GET")
-	api.HandleFunc("/emunets/{namespace}/{name}/status", s.getEmuNetStatus).Methods("GET")
-	api.HandleFunc("/emunets/{namespace}/{name}/pods", s.listPods).Methods("GET")
-	api.HandleFunc("/emunets/{namespace}/{name}/pods/{podName}", s.getPod).Methods("GET")
-	api.HandleFunc("/health", s.healthCheck).Methods("GET")
-
-	// 核心高并发接口：规则下发
-	api.HandleFunc("/ebpf/entry/by-pods", s.handleEBPFEntryByPods).Methods("POST")
-	api.HandleFunc("/ebpf/entry/by-pods", s.handleEBPFEntryDeleteByPods).Methods("DELETE")
+// Stop 优雅关闭
+func (s *MasterServer) Stop() {
+	s.logger.Info("Stopping Master Server, waiting for workers...")
+	close(s.jobQueue) // 关闭通道，Worker 处理完剩余数据后会自动退出
+	s.wg.Wait()       // 等待所有 Worker 归队
+	s.cancel()        // 取消上下文
+	s.logger.Info("Master Server stopped gracefully.")
 }
 
 func (s *MasterServer) GetRouter() *mux.Router {
 	return s.router
 }
 
-// ==========================================
-// 核心优化：高并发处理逻辑
-// ==========================================
+func (s *MasterServer) setupRoutes() {
+	// API 版本控制
+	v1 := s.router.PathPrefix("/api/v1").Subrouter()
 
-func (s *MasterServer) handleEBPFEntryByPods(w http.ResponseWriter, r *http.Request) {
+	// --- Group A: 系统探针 ---
+	v1.HandleFunc("/health", s.healthCheck).Methods("GET")
+
+	// --- Group B: 控制平面 (Control Plane) - 高频、写操作 ---
+	// 负责规则的下发、更新、删除。要求极致性能。
+	v1.HandleFunc("/ebpf/entry/by-pods", s.handleRuleCreate).Methods("POST")
+	v1.HandleFunc("/ebpf/entry/by-pods", s.handleRuleDelete).Methods("DELETE")
+
+	// --- Group C: 查询平面 (Query Plane) - 低频、读操作 ---
+	// 负责查询当前的状态、拓扑信息。直接查 Redis。
+	v1.HandleFunc("/emunets/{namespace}/{name}/pods", s.listPodsFromCache).Methods("GET")
+
+	// 占位接口 (按需实现)
+	v1.HandleFunc("/emunets", s.notImplemented).Methods("GET")
+}
+
+// =================================================================================
+// 3. Worker 系统 (Async Dispatcher)
+// =================================================================================
+
+func (s *MasterServer) startWorkers() {
+	s.logger.Info("Starting background workers", zap.Int("count", WorkerCount))
+
+	for i := 0; i < WorkerCount; i++ {
+		s.wg.Add(1)
+		go func(workerID int) {
+			defer s.wg.Done()
+
+			// 循环直到 jobQueue 关闭
+			for job := range s.jobQueue {
+				s.executeAgentJob(job)
+			}
+		}(i)
+	}
+}
+
+func (s *MasterServer) executeAgentJob(job AgentJob) {
+	url := fmt.Sprintf("http://%s:%d/api/ebpf/entry", job.TargetNodeIP, AgentPort)
+
+	req, err := http.NewRequest(job.Method, url, bytes.NewBuffer(job.Payload))
+	if err != nil {
+		s.logger.Error("Failed to create request", zap.Error(err))
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		// 生产环境建议：此处应加入重试机制或死信队列 (DLQ)
+		// s.logger.Warn("Failed to send to agent", zap.String("node", job.TargetNodeIP), zap.Error(err))
+		return
+	}
+
+	// 关键：读取并丢弃 Body，确保 TCP 连接能被复用
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+}
+
+// =================================================================================
+// 4. Group B: 控制平面 Handlers (高频核心逻辑)
+// =================================================================================
+
+func (s *MasterServer) handleRuleCreate(w http.ResponseWriter, r *http.Request) {
 	var req EBPFEntryByPodsRequest
-	// 使用 json.Decoder 流式解析，减少内存分配
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.sendError(w, http.StatusBadRequest, "Invalid JSON body")
+
+	// 使用 Strict Decoding 防止字段拼写错误
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		s.sendError(w, http.StatusBadRequest, "Invalid JSON: "+err.Error())
 		return
 	}
 
@@ -177,32 +208,25 @@ func (s *MasterServer) handleEBPFEntryByPods(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// 优化1: O(1) Redis 查找
-	// 直接读取 Agent 上报并存入 Redis 的 "pod_lookup:{name}" 键
-	// 这避免了遍历整个 Pod 列表，将复杂度从 O(N) 降为 O(1)
+	// 1. O(1) Redis Lookup
+	// 移除了 K8s Client，完全依赖 Controller 同步到 Redis 的数据
 	pod1Info, err1 := s.redis.GetPodInfoDirectly(r.Context(), req.Pod1)
 	pod2Info, err2 := s.redis.GetPodInfoDirectly(r.Context(), req.Pod2)
 
-	// 校验数据完整性
 	if err1 != nil || err2 != nil || pod1Info == nil || pod2Info == nil {
-		s.sendError(w, http.StatusNotFound, fmt.Sprintf("Pod info not found in cache (p1:%v, p2:%v)", err1 == nil, err2 == nil))
+		s.sendError(w, http.StatusNotFound, "Pod info not found in cache. Is the Pod running?")
 		return
 	}
 
-	if pod1Info.NodeName == "" || pod2Info.NodeName == "" {
-		s.sendError(w, http.StatusBadRequest, "Pod not scheduled to a node yet")
+	// 2. 校验节点和 MAC
+	if pod1Info.NodeName == "" || pod2Info.NodeName == "" || pod1Info.MACAddress == "" || pod2Info.MACAddress == "" {
+		s.sendError(w, http.StatusPreconditionFailed, "Pod metadata incomplete (missing Node or MAC)")
 		return
 	}
 
-	if pod1Info.MACAddress == "" || pod2Info.MACAddress == "" {
-		s.sendError(w, http.StatusBadRequest, "Pod MAC address not reported by agent yet")
-		return
-	}
-
-	// 构造发给 Agent 的 Payload
-	// 逻辑：在目标节点 (Node2) 上限制来自源 Pod (Pod1) 的流量
-	// 这里的 IfIndex 是目标 Pod 在其所在节点上的 veth 索引
-	job1Payload, _ := json.Marshal(EBPFEntryRequest{
+	// 3. 构造双向规则
+	// 规则 A: 告诉 Node2，来自 Pod1 (MAC1) 的包要限制
+	job1Payload, _ := json.Marshal(AgentRequest{
 		Ifindex:         uint32(pod2Info.VethIfIndex),
 		SrcMac:          pod1Info.MACAddress,
 		ThrottleRateBps: req.ThrottleRateBps,
@@ -211,8 +235,8 @@ func (s *MasterServer) handleEBPFEntryByPods(w http.ResponseWriter, r *http.Requ
 		Jitter:          req.Jitter,
 	})
 
-	// 对称规则：在 Node1 上限制来自 Pod2 的流量
-	job2Payload, _ := json.Marshal(EBPFEntryRequest{
+	// 规则 B: 告诉 Node1，来自 Pod2 (MAC2) 的包要限制
+	job2Payload, _ := json.Marshal(AgentRequest{
 		Ifindex:         uint32(pod1Info.VethIfIndex),
 		SrcMac:          pod2Info.MACAddress,
 		ThrottleRateBps: req.ThrottleRateBps,
@@ -221,92 +245,98 @@ func (s *MasterServer) handleEBPFEntryByPods(w http.ResponseWriter, r *http.Requ
 		Jitter:          req.Jitter,
 	})
 
-	// 优化2: 非阻塞入队
-	// 尝试将任务放入队列，如果队列满则快速失败，保护 Master 不被撑爆
-	select {
-	case s.jobQueue <- AgentJob{TargetNodeIP: pod2Info.NodeName, Method: "POST", Payload: job1Payload}:
-	default:
-		s.sendError(w, http.StatusServiceUnavailable, "Job queue full")
+	// 4. 非阻塞入队 (Fast Fail)
+	if !s.enqueueJob(pod2Info.NodeName, "POST", job1Payload) {
+		s.sendError(w, http.StatusServiceUnavailable, "Job queue overloaded")
 		return
 	}
+	s.enqueueJob(pod1Info.NodeName, "POST", job2Payload) // Best effort for the second one
 
-	select {
-	case s.jobQueue <- AgentJob{TargetNodeIP: pod1Info.NodeName, Method: "POST", Payload: job2Payload}:
-	default:
-		// 尽力而为
-	}
-
-	// 立即返回，不等待 Agent 响应，极大地提高了 Master 的吞吐量
-	s.sendSuccess(w, map[string]string{
-		"status":  "queued",
-		"message": "Rule update tasks dispatched to agents",
-	})
+	s.sendSuccess(w, map[string]string{"status": "queued", "tx_id": fmt.Sprintf("%d", time.Now().UnixNano())})
 }
 
-func (s *MasterServer) handleEBPFEntryDeleteByPods(w http.ResponseWriter, r *http.Request) {
+func (s *MasterServer) handleRuleDelete(w http.ResponseWriter, r *http.Request) {
 	var req EBPFEntryDeleteByPodsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.sendError(w, http.StatusBadRequest, "Invalid JSON body")
 		return
 	}
 
-	// O(1) 查找
 	pod1Info, err1 := s.redis.GetPodInfoDirectly(r.Context(), req.Pod1)
 	pod2Info, err2 := s.redis.GetPodInfoDirectly(r.Context(), req.Pod2)
 
+	// 幂等性：如果缓存里没这 Pod，说明可能已经被删除了，直接返回成功
 	if err1 != nil || err2 != nil || pod1Info == nil || pod2Info == nil {
-		// 删除时如果找不到 Pod，视为成功（幂等性）
-		s.sendSuccess(w, "Pod not found, cleanup skipped")
+		s.sendSuccess(w, "Cleanup skipped: Pod not found")
 		return
 	}
 
-	// 构造删除任务
-	del1Payload, _ := json.Marshal(EBPFEntryDeleteRequest{
+	// 构造删除 Payload (只包含识别 Key)
+	del1Payload, _ := json.Marshal(AgentRequest{
 		Ifindex: uint32(pod2Info.VethIfIndex),
 		SrcMac:  pod1Info.MACAddress,
 	})
-
-	del2Payload, _ := json.Marshal(EBPFEntryDeleteRequest{
+	del2Payload, _ := json.Marshal(AgentRequest{
 		Ifindex: uint32(pod1Info.VethIfIndex),
 		SrcMac:  pod2Info.MACAddress,
 	})
 
-	// 入队
-	select {
-	case s.jobQueue <- AgentJob{TargetNodeIP: pod2Info.NodeName, Method: "DELETE", Payload: del1Payload}:
-	default:
-		s.sendError(w, http.StatusServiceUnavailable, "Job queue full")
+	if !s.enqueueJob(pod2Info.NodeName, "DELETE", del1Payload) {
+		s.sendError(w, http.StatusServiceUnavailable, "Job queue overloaded")
 		return
 	}
+	s.enqueueJob(pod1Info.NodeName, "DELETE", del2Payload)
 
-	select {
-	case s.jobQueue <- AgentJob{TargetNodeIP: pod1Info.NodeName, Method: "DELETE", Payload: del2Payload}:
-	default:
-	}
-
-	s.sendSuccess(w, map[string]string{
-		"status":  "queued",
-		"message": "Rule delete tasks dispatched to agents",
-	})
+	s.sendSuccess(w, map[string]string{"status": "queued"})
 }
 
-func (s *MasterServer) listPods(w http.ResponseWriter, r *http.Request) {
+// 辅助函数：安全入队
+func (s *MasterServer) enqueueJob(nodeIP, method string, payload []byte) bool {
+	select {
+	case s.jobQueue <- AgentJob{TargetNodeIP: nodeIP, Method: method, Payload: payload}:
+		return true
+	default:
+		s.logger.Warn("Job queue full, dropping request", zap.String("target", nodeIP))
+		return false
+	}
+}
+
+// =================================================================================
+// 5. Group C: 查询平面 Handlers (只读操作)
+// =================================================================================
+
+func (s *MasterServer) listPodsFromCache(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	ns := vars["namespace"]
 	name := vars["name"]
 
-	// 使用 Redis 的 ListPodStatuses (它会从 Redis Set 中读取)
-	// 这是一个优化过的操作
+	// 直接从 Redis 集合中读取，这要求 Controller 维护好 "emunet:pods:{ns}:{name}" 这个 Set
 	pods, err := s.redis.ListPodStatuses(r.Context(), ns, name)
 	if err != nil {
-		s.sendError(w, http.StatusInternalServerError, err.Error())
+		s.logger.Error("Redis list error", zap.Error(err))
+		s.sendError(w, http.StatusInternalServerError, "Failed to retrieve pod list")
 		return
 	}
 
 	s.sendSuccess(w, pods)
 }
 
-// --- 辅助函数 ---
+func (s *MasterServer) healthCheck(w http.ResponseWriter, r *http.Request) {
+	// 简单的健康检查，可以增加 Redis Ping 检查
+	if err := s.redis.Ping(r.Context()); err != nil {
+		s.sendError(w, http.StatusServiceUnavailable, "Redis disconnected")
+		return
+	}
+	s.sendSuccess(w, map[string]string{"status": "healthy", "worker_count": fmt.Sprintf("%d", WorkerCount)})
+}
+
+func (s *MasterServer) notImplemented(w http.ResponseWriter, r *http.Request) {
+	s.sendError(w, http.StatusNotImplemented, "API endpoint not implemented or deprecated")
+}
+
+// =================================================================================
+// 6. HTTP Helper Functions
+// =================================================================================
 
 func (s *MasterServer) sendSuccess(w http.ResponseWriter, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -318,21 +348,4 @@ func (s *MasterServer) sendError(w http.ResponseWriter, statusCode int, message 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	json.NewEncoder(w).Encode(Response{Success: false, Error: message})
-}
-
-// 占位函数：保持原有接口定义，具体逻辑复用之前的实现
-func (s *MasterServer) listEmuNets(w http.ResponseWriter, r *http.Request) {
-	s.sendSuccess(w, "impl pending")
-}
-func (s *MasterServer) getEmuNet(w http.ResponseWriter, r *http.Request) {
-	s.sendSuccess(w, "impl pending")
-}
-func (s *MasterServer) getEmuNetStatus(w http.ResponseWriter, r *http.Request) {
-	s.sendSuccess(w, "impl pending")
-}
-func (s *MasterServer) getPod(w http.ResponseWriter, r *http.Request) {
-	s.sendSuccess(w, "impl pending")
-}
-func (s *MasterServer) healthCheck(w http.ResponseWriter, r *http.Request) {
-	s.sendSuccess(w, map[string]string{"status": "healthy"})
 }
