@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: emunet-ebpf-agent
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      name: emunet-ebpf-agent
+  template:
+    metadata:
+      labels:
+        name: emunet-ebpf-agent
+    spec:
+      tolerations:
+      - key: dedicated
+        operator: Equal
+        value: emu-master
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/master
+        operator: Exists
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      
+      hostNetwork: true
+      
+      initContainers:
+      - name: install-cni
+        image: emunet-node:v1.0
+        command:
+        - /bin/sh
+        - -c
+        - |
+          set -e
+          # 1. 物理拷贝
+          cp /app/emu-cni /host/opt/cni/bin/emu-cni
+          chmod +x /host/opt/cni/bin/emu-cni
+
+          CONF="/host/etc/cni/net.d/01-kube-ovn.conflist"
+          if [ -f "$CONF" ]; then
+            # 2. 严格判断：是否存在 emu-cni
+            if grep -q "\"type\":[[:space:]]*\"emu-cni\"" "$CONF"; then
+                echo "emu-cni already exists, skipping."
+            else
+                echo "Appending emu-cni with precise positioning..."
+                
+                # 3. 修复逻辑：
+                # N; 使得 sed 能够看到下一行。
+                # 只有当下一行是 plugins 数组的结束符 ] 时，才在当前行末尾 } 加逗号。
+                # 这完美避开了 capabilities 内部的大括号。
+                sed -i 'N; s/}[[:space:]]*\n[[:space:]]*\]/},\n    \]/; P; D' "$CONF"
+                
+                # 4. 在 ] 之前插入新块
+                sed -i '/\]/i \        {\n            "type": "emu-cni"\n        }' "$CONF"
+                
+                # 5. 最后修正：确保最后一个插件块后面没有多余逗号（防止 JSON 严格模式报错）
+                # 匹配： }, 换行 ]  替换为： } 换行 ]
+                sed -i 'N; s/},[[:space:]]*\n[[:space:]]*\]/}\n    \]/; P; D' "$CONF"
+                
+                echo "Successfully updated CNI config."
+            fi
+          fi
+        volumeMounts:
+        - name: cni-bin-dir
+          mountPath: /host/opt/cni/bin
+        - name: cni-conf-dir
+          mountPath: /host/etc/cni/net.d
+
+      containers:
+      - name: node-agent
+        image: emunet-node:v1.0
+        args: ["-redis-addr=100.75.179.29:6379"]
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: sys
+          mountPath: /sys
+        - name: bpf-fs
+          mountPath: /sys/fs/bpf
+        - name: modules
+          mountPath: /lib/modules
+          readOnly: true
+
+      volumes:
+      - name: cni-bin-dir
+        hostPath:
+          path: /opt/cni/bin
+      - name: cni-conf-dir
+        hostPath:
+          path: /etc/cni/net.d
+      - name: sys
+        hostPath:
+          path: /sys
+      - name: bpf-fs
+        hostPath:
+          path: /sys/fs/bpf
+          type: DirectoryOrCreate
+      - name: modules
+        hostPath:
+          path: /lib/modules

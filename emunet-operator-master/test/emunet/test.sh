@@ -1,19 +1,19 @@
-curl -X POST http://192.168.1.103:12345/api/ebpf/entry \
+curl -X POST http://localhost:12345/api/ebpf/entry \
   -H "Content-Type: application/json" \
   -d '{
-    "ifindex": 1344,
-    "srcMac": "1a:e3:3c:5a:ec:5e",
+    "ifindex": 348,
+    "srcMac": "00:00:00:99:0b:b1",
     "throttleRateBps": 1000000,
     "delay": 1000,
     "lossRate": 500,
     "jitter": 10
   }'
 
-curl -X DELETE http://192.168.1.103:12345/api/ebpf/entry \
+curl -X DELETE http://localhost:12345/api/ebpf/entry \
   -H "Content-Type: application/json" \
   -d '{
-    "ifindex": 1344,  
-    "srcMac": "1a:e3:3c:5a:ec:5e" 
+    "ifindex": 348,  
+    "srcMac": "00:00:00:99:0b:b1" 
   }'
 
   curl -X POST http://localhost:8080/apis/emunet.emunet.io/v1/namespaces/default/emunets \
@@ -26,8 +26,8 @@ curl -X DELETE http://192.168.1.103:12345/api/ebpf/entry \
 curl -X POST http://localhost:8082/api/v1/ebpf/entry/by-pods \
   -H "Content-Type: application/json" \
   -d '{
-    "pod1": "emunet-example-group0-4",
-    "pod2": "emunet-example-group0-3",
+    "pod1": "emunet-example-group0-0",
+    "pod2": "emunet-example-group0-10",
     "throttleRateBps": 1000000,
     "delay": 1000,
     "lossRate": 2500,
@@ -37,6 +37,6 @@ curl -X POST http://localhost:8082/api/v1/ebpf/entry/by-pods \
 curl -X DELETE http://localhost:8082/api/v1/ebpf/entry/by-pods \
   -H "Content-Type: application/json" \
   -d '{
-    "pod1": "emunet-example-group0-4",
-    "pod2": "emunet-example-group0-3"
+    "pod1": "emunet-example-group0-0",
+    "pod2": "emunet-example-group0-10"
   }'

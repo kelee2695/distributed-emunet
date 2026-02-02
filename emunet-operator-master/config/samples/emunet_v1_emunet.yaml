@@ -11,5 +11,5 @@ spec:
   imageGroups:
     - image: nginx:alpine
       replicas: 18
-    - image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/k8s.gcr.io/pause:3.2
+    - image: k8s.gcr.io/pause:3.2
       replicas: 2
