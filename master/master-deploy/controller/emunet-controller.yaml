@@ -1,0 +1,146 @@
+# -----------------------------------------------------------------------------
+# 1. ServiceAccount (统一名称: emunet-controller, 命名空间: kube-system)
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: emunet-controller
+  namespace: kube-system # 修改为 kube-system
+
+---
+# -----------------------------------------------------------------------------
+# 2. ClusterRole (权限保持不变)
+# -----------------------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: emunet-controller-role # 名称保持一致性
+rules:
+  - apiGroups:
+      - emunet.emunet.io
+    resources:
+      - emunets
+      - emunets/status
+      - emunets/finalizers
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+
+---
+# -----------------------------------------------------------------------------
+# 3. ClusterRoleBinding (绑定 kube-system 下的账号)
+# -----------------------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: emunet-controller-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: emunet-controller-role
+subjects:
+  - kind: ServiceAccount
+    name: emunet-controller # 对应上面的 SA 名称
+    namespace: kube-system  # 【重要】必须指向 kube-system
+
+---
+# -----------------------------------------------------------------------------
+# 4. Deployment (部署到 kube-system, 统一名称)
+# -----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: emunet-controller     # 统一名称
+  namespace: kube-system      # 修改为 kube-system
+  labels:
+    app: emunet-controller    # 统一标签
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: emunet-controller
+  template:
+    metadata:
+      labels:
+        app: emunet-controller
+    spec:
+      serviceAccountName: emunet-controller
+
+      nodeSelector:
+        node-role.kubernetes.io/master: ""
+      
+      tolerations:
+        - key: "node-role.kubernetes.io/master"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "dedicated"
+          operator: "Equal"
+          value: "emu-master"
+          effect: "NoSchedule"
+
+      containers:
+        - name: manager
+          image: emunet-controller:v1.0
+          imagePullPolicy: IfNotPresent
+          command: ["/controller"]
+          args:
+            - --leader-elect
+            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=:8443
+            - --redis-addr=100.75.179.29:6379
+          
+          resources:
+            limits:
+              cpu: 500m
+              memory: 128Mi
+            requests:
+              cpu: 10m
+              memory: 64Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10

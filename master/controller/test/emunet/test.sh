@@ -23,7 +23,7 @@ curl -X DELETE http://localhost:12345/api/ebpf/entry \
   curl -X DELETE http://localhost:8080/apis/emunet.emunet.io/v1/namespaces/default/emunets/emunet-example
 
 
-curl -X POST http://localhost:8082/api/v1/ebpf/entry/by-pods \
+curl -X POST http://localhost:30082/api/v1/ebpf/entry/by-pods \
   -H "Content-Type: application/json" \
   -d '{
     "pod1": "emunet-example-group0-0",
@@ -34,7 +34,7 @@ curl -X POST http://localhost:8082/api/v1/ebpf/entry/by-pods \
     "jitter": 10
   }'
 
-curl -X DELETE http://localhost:8082/api/v1/ebpf/entry/by-pods \
+curl -X DELETE http://localhost:30082/api/v1/ebpf/entry/by-pods \
   -H "Content-Type: application/json" \
   -d '{
     "pod1": "emunet-example-group0-0",

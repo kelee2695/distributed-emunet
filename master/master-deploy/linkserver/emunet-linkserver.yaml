@@ -1,0 +1,90 @@
+# -----------------------------------------------------------------------------
+# 1. Deployment (部署应用 + hostAliases 注入)
+# -----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: emunet-linkserver
+  namespace: kube-system # 保持与 Controller 一致
+  labels:
+    app: emunet-linkserver
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: emunet-linkserver
+  template:
+    metadata:
+      labels:
+        app: emunet-linkserver
+    spec:
+      hostAliases:
+        - ip: "100.75.179.29"
+          hostnames:
+            - "k8s-master01"
+        - ip: "100.115.244.45"
+          hostnames:
+            - "k8s-node01"
+        - ip: "100.90.181.123"
+          hostnames:
+            - "njuee"
+
+      # 强制调度到 Master 节点
+      nodeSelector:
+        node-role.kubernetes.io/master: ""
+      
+      # 容忍度设置 (包含你Master节点上的自定义污点)
+      tolerations:
+        - key: "node-role.kubernetes.io/master"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+        # 【关键】容忍你的自定义污点
+        - key: "dedicated"
+          operator: "Equal"
+          value: "emu-master"
+          effect: "NoSchedule"
+
+      containers:
+        - name: linkserver
+          image: emunet-linkserver:v1.0
+          imagePullPolicy: IfNotPresent
+          command: ["/linkserver"]
+          args:
+            # 绑定 0.0.0.0 才能被外部访问
+            - --api-bind-address=:8082
+            # 【注意】Redis 地址
+            - --redis-addr=100.75.179.29:6379
+          
+          ports:
+            - containerPort: 8082
+              name: http
+          
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+            requests:
+              cpu: 10m
+              memory: 64Mi
+
+---
+# -----------------------------------------------------------------------------
+# 2. Service (将端口映射到主机)
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: emunet-linkserver-svc
+  namespace: kube-system
+spec:
+  type: NodePort # 使用 NodePort 类型映射到主机
+  selector:
+    app: emunet-linkserver
+  ports:
+    - protocol: TCP
+      port: 8082        # Service 内部端口 (集群内访问)
+      targetPort: 8082  # 容器端口
+      nodePort: 30082    # 主机映射端口
