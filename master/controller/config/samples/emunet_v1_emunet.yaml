@@ -1,0 +1,15 @@
+apiVersion: emunet.emunet.io/v1
+kind: EmuNet
+metadata:
+  name: emunet-example
+  namespace: default
+spec:
+  totalReplicas: 20
+  selector:
+    matchLabels:
+      app: emunet-pod
+  imageGroups:
+    - image: nginx:alpine
+      replicas: 18
+    - image: k8s.gcr.io/pause:3.2
+      replicas: 2
