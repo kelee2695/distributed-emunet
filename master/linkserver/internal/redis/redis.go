@@ -12,6 +12,9 @@ import (
 const (
 	// Key TTL (Time To Live) to prevent stale data leaking
 	DefaultTTL = 24 * time.Hour
+
+	// Control Bus Constants
+	CommandTTL = 5 * time.Minute
 )
 
 type Client struct {
@@ -43,9 +46,29 @@ type PodStatus struct {
 	Phase       string    `json:"phase,omitempty"`
 	Ready       bool      `json:"ready,omitempty"`
 	Message     string    `json:"message,omitempty"`
-	MACAddress  string    `json:"macAddress,omitempty"`  // Agent updates this
-	VethIfIndex int       `json:"vethIfIndex,omitempty"` // Agent updates this
+	MACAddress  string    `json:"macAddress,omitempty"`
+	VethIfIndex int       `json:"vethIfIndex,omitempty"`
 	LastUpdated time.Time `json:"lastUpdated"`
+}
+
+// ControlCommand represents a control command sent via Redis Stream
+type ControlCommand struct {
+	CommandID   string        `json:"commandId"`
+	CommandType string        `json:"commandType"`
+	TargetNode  string        `json:"targetNode"`
+	Payload     string        `json:"payload"`
+	Timestamp   time.Time     `json:"timestamp"`
+	TTL         time.Duration `json:"ttl"`
+}
+
+// EBPFCommandPayload represents the payload for eBPF control commands
+type EBPFCommandPayload struct {
+	Ifindex         uint32 `json:"ifindex"`
+	SrcMac          string `json:"srcMac"`
+	ThrottleRateBps uint32 `json:"throttleRateBps,omitempty"`
+	Delay           uint32 `json:"delay,omitempty"`
+	LossRate        uint32 `json:"lossRate,omitempty"`
+	Jitter          uint32 `json:"jitter,omitempty"`
 }
 
 // NewClient creates a redis client.
@@ -274,4 +297,47 @@ func (c *Client) SavePodStatus(ctx context.Context, namespace, name string, pod 
 
 func (c *Client) GetPodStatus(ctx context.Context, namespace, name, podName string) (*PodStatus, error) {
 	return c.GetPodInfoDirectly(ctx, podName)
+}
+
+// ==========================================
+// Control Bus Operations (Redis Stream)
+// ==========================================
+
+// PublishEBPFCommand publishes an eBPF control command to the Redis Stream
+func (c *Client) PublishEBPFCommand(ctx context.Context, targetNode, commandType string, payload *EBPFCommandPayload) error {
+	payloadData, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	command := &ControlCommand{
+		CommandID:   fmt.Sprintf("%s-%d", commandType, time.Now().UnixNano()),
+		CommandType: commandType,
+		TargetNode:  targetNode,
+		Payload:     string(payloadData),
+		Timestamp:   time.Now(),
+		TTL:         CommandTTL,
+	}
+
+	return c.PublishCommand(ctx, command)
+}
+
+// PublishCommand publishes a generic control command to the Redis Stream
+func (c *Client) PublishCommand(ctx context.Context, command *ControlCommand) error {
+	values := map[string]interface{}{
+		"commandId":   command.CommandID,
+		"commandType": command.CommandType,
+		"payload":     command.Payload,
+		"timestamp":   command.Timestamp.UnixNano(),
+		"ttl":         command.TTL.Milliseconds(),
+	}
+
+	streamKey := fmt.Sprintf("control:node:%s", command.TargetNode)
+
+	_, err := c.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: streamKey,
+		Values: values,
+	}).Result()
+
+	return err
 }

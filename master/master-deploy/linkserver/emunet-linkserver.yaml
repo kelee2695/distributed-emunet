@@ -49,8 +49,8 @@ spec:
 
       containers:
         - name: linkserver
-          image: emunet-linkserver:v1.0
-          imagePullPolicy: IfNotPresent
+          image: 100.75.179.29:5000/emunet/linkserver:latest
+          imagePullPolicy: Always
           command: ["/linkserver"]
           args:
             # 绑定 0.0.0.0 才能被外部访问

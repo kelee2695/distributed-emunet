@@ -28,7 +28,7 @@ spec:
       
       initContainers:
       - name: install-cni
-        image: emunet-node:v1.0
+        image: 100.75.179.29:5000/emunet/node-agent:latest
         command:
         - /bin/sh
         - -c
@@ -70,8 +70,15 @@ spec:
 
       containers:
       - name: node-agent
-        image: emunet-node:v1.0
-        args: ["-redis-addr=100.75.179.29:6379"]
+        image: 100.75.179.29:5000/emunet/node-agent:latest
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        args:
+        - --redis-addr=100.75.179.29:6379
+        - --node-name=$(NODE_NAME)
         securityContext:
           privileged: true
         volumeMounts:

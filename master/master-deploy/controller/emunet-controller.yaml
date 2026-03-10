@@ -116,8 +116,8 @@ spec:
 
       containers:
         - name: manager
-          image: emunet-controller:v1.0
-          imagePullPolicy: IfNotPresent
+          image: 100.75.179.29:5000/emunet/controller:latest
+          imagePullPolicy: Always
           command: ["/controller"]
           args:
             - --leader-elect

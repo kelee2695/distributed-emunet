@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -12,6 +13,10 @@ import (
 const (
 	// Key TTL (Time To Live) to prevent stale data leaking
 	DefaultTTL = 24 * time.Hour
+
+	// Control Bus Constants
+	CommandTTL = 5 * time.Minute
+	BlockTime  = 100 * time.Millisecond
 )
 
 type Client struct {
@@ -43,9 +48,29 @@ type PodStatus struct {
 	Phase       string    `json:"phase,omitempty"`
 	Ready       bool      `json:"ready,omitempty"`
 	Message     string    `json:"message,omitempty"`
-	MACAddress  string    `json:"macAddress,omitempty"`  // Agent updates this
-	VethIfIndex int       `json:"vethIfIndex,omitempty"` // Agent updates this
+	MACAddress  string    `json:"macAddress,omitempty"`
+	VethIfIndex int       `json:"vethIfIndex,omitempty"`
 	LastUpdated time.Time `json:"lastUpdated"`
+}
+
+// ControlCommand represents a control command received from Redis Stream
+type ControlCommand struct {
+	CommandID   string          `json:"commandId"`
+	CommandType string          `json:"commandType"`
+	TargetNode  string          `json:"targetNode"`
+	Payload     json.RawMessage `json:"payload"`
+	Timestamp   time.Time       `json:"timestamp"`
+	TTL         time.Duration   `json:"ttl"`
+}
+
+// EBPFCommandPayload represents the payload for eBPF control commands
+type EBPFCommandPayload struct {
+	Ifindex         uint32 `json:"ifindex"`
+	SrcMac          string `json:"srcMac"`
+	ThrottleRateBps uint32 `json:"throttleRateBps,omitempty"`
+	Delay           uint32 `json:"delay,omitempty"`
+	LossRate        uint32 `json:"lossRate,omitempty"`
+	Jitter          uint32 `json:"jitter,omitempty"`
 }
 
 // NewClient creates a redis client.
@@ -71,6 +96,11 @@ func (c *Client) Ping(ctx context.Context) error {
 
 func (c *Client) Close() error {
 	return c.client.Close()
+}
+
+// GetClient returns the underlying redis.Client
+func (c *Client) GetClient() *redis.Client {
+	return c.client
 }
 
 // ==========================================
@@ -274,4 +304,150 @@ func (c *Client) SavePodStatus(ctx context.Context, namespace, name string, pod 
 
 func (c *Client) GetPodStatus(ctx context.Context, namespace, name, podName string) (*PodStatus, error) {
 	return c.GetPodInfoDirectly(ctx, podName)
+}
+
+// ==========================================
+// Control Bus Consumer (Redis Stream)
+// ==========================================
+
+// ControlBusConsumer consumes control commands from Redis Stream
+type ControlBusConsumer struct {
+	client        *redis.Client
+	consumerID    string
+	streamKey     string
+	consumerGroup string
+	targetNode    string
+	handler       CommandHandler
+	ctx           context.Context
+	cancel        context.CancelFunc
+	logger        interface{}
+}
+
+// CommandHandler handles incoming control commands
+type CommandHandler func(ctx context.Context, command *ControlCommand) error
+
+// NewControlBusConsumer creates a new control bus consumer
+func NewControlBusConsumer(client *redis.Client, consumerID, targetNode string, handler CommandHandler) *ControlBusConsumer {
+	ctx, cancel := context.WithCancel(context.Background())
+	streamKey := fmt.Sprintf("control:node:%s", targetNode)
+	return &ControlBusConsumer{
+		client:        client,
+		consumerID:    consumerID,
+		streamKey:     streamKey,
+		consumerGroup: fmt.Sprintf("agent-%s", targetNode),
+		targetNode:    targetNode,
+		handler:       handler,
+		ctx:           ctx,
+		cancel:        cancel,
+	}
+}
+
+// Start begins consuming messages from the control stream
+func (c *ControlBusConsumer) Start() error {
+	if err := c.createConsumerGroup(); err != nil {
+		return err
+	}
+
+	go c.consumeLoop()
+	return nil
+}
+
+// Stop stops the consumer
+func (c *ControlBusConsumer) Stop() {
+	c.cancel()
+}
+
+// createConsumerGroup creates the consumer group if it doesn't exist
+func (c *ControlBusConsumer) createConsumerGroup() error {
+	err := c.client.XGroupCreateMkStream(c.ctx, c.streamKey, c.consumerGroup, "0").Err()
+	if err != nil {
+		if err.Error() == "BUSYGROUP Consumer Group name already exists" {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// consumeLoop continuously reads and processes messages
+func (c *ControlBusConsumer) consumeLoop() {
+	ticker := time.NewTicker(BlockTime)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			c.consumeMessages()
+		}
+	}
+}
+
+// consumeMessages reads and processes messages from the stream
+func (c *ControlBusConsumer) consumeMessages() {
+	streams, err := c.client.XReadGroup(c.ctx, &redis.XReadGroupArgs{
+		Group:    c.consumerGroup,
+		Consumer: c.consumerID,
+		Streams:  []string{c.streamKey, ">"},
+		Count:    10,
+		Block:    0,
+	}).Result()
+
+	if err != nil && err != redis.Nil {
+		return
+	}
+
+	var messageIDs []string
+
+	for _, stream := range streams {
+		for _, message := range stream.Messages {
+			if c.processMessage(message) {
+				messageIDs = append(messageIDs, message.ID)
+			}
+		}
+	}
+
+	if len(messageIDs) > 0 {
+		c.ackMessages(messageIDs)
+	}
+}
+
+// processMessage processes a single message
+func (c *ControlBusConsumer) processMessage(message redis.XMessage) bool {
+	timestampStr, _ := message.Values["timestamp"].(string)
+	timestamp, _ := strconv.ParseInt(timestampStr, 10, 64)
+
+	command := &ControlCommand{
+		CommandID:   message.ID,
+		CommandType: message.Values["commandType"].(string),
+		Timestamp:   time.Unix(0, timestamp),
+	}
+
+	if payload, ok := message.Values["payload"].(string); ok {
+		command.Payload = json.RawMessage(payload)
+	}
+
+	if c.handler != nil {
+		if err := c.handler(c.ctx, command); err != nil {
+			return false
+		}
+	}
+
+	return true
+}
+
+// ackMessages acknowledges processed messages
+func (c *ControlBusConsumer) ackMessages(messageIDs []string) error {
+	if len(messageIDs) == 0 {
+		return nil
+	}
+
+	pipe := c.client.Pipeline()
+	for _, id := range messageIDs {
+		pipe.XAck(c.ctx, c.streamKey, c.consumerGroup, id)
+	}
+
+	_, err := pipe.Exec(c.ctx)
+	return err
 }

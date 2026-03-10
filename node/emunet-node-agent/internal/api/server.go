@@ -262,6 +262,11 @@ func (s *AgentServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status":"healthy"}`))
 }
 
+// GetEBPFMap returns the eBPF map instance
+func (s *AgentServer) GetEBPFMap() (*ebpf.Map, error) {
+	return s.getEBPFMap()
+}
+
 // ==========================================
 // 5. EBPF Helpers
 // ==========================================
