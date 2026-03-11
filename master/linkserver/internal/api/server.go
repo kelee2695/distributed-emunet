@@ -10,7 +10,7 @@ import (
 	"github.com/gorilla/mux"
 	"go.uber.org/zap"
 
-	"emunet/linkserver/internal/redis"
+	"github.com/emunet/emunet-operator/pkg/redis"
 )
 
 const (

@@ -16,8 +16,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	emunetv1 "emunet/controller/api/v1"
-	"emunet/controller/internal/redis"
+	emunetv1 "github.com/emunet/emunet-operator/master/controller/api/v1"
+	"github.com/emunet/emunet-operator/pkg/redis"
 )
 
 type EmuNetReconciler struct {

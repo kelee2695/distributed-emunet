@@ -12,8 +12,8 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/gorilla/mux"
 
-	"github.com/emunet/emunet-operator/internal/redis"
-	"github.com/emunet/emunet-operator/pkg"
+	"github.com/emunet/emunet-operator/node/emunet-node-agent/pkg"
+	"github.com/emunet/emunet-operator/pkg/redis"
 )
 
 // ==========================================

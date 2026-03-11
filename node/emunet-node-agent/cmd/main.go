@@ -14,9 +14,9 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/emunet/emunet-operator/internal/api"
-	"github.com/emunet/emunet-operator/internal/redis"
-	"github.com/emunet/emunet-operator/pkg"
+	"github.com/emunet/emunet-operator/node/emunet-node-agent/internal/api"
+	"github.com/emunet/emunet-operator/node/emunet-node-agent/pkg"
+	"github.com/emunet/emunet-operator/pkg/redis"
 )
 
 func main() {
@@ -119,7 +119,7 @@ func main() {
 func handleControlCommand(server *api.AgentServer) redis.CommandHandler {
 	return func(ctx context.Context, command *redis.ControlCommand) error {
 		var payload redis.EBPFCommandPayload
-		if err := json.Unmarshal(command.Payload, &payload); err != nil {
+		if err := json.Unmarshal([]byte(command.Payload), &payload); err != nil {
 			return err
 		}
 

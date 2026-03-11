@@ -36,9 +36,9 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	emunetv1 "emunet/controller/api/v1"
-	"emunet/controller/internal/controller"
-	"emunet/controller/internal/redis"
+	emunetv1 "github.com/emunet/emunet-operator/master/controller/api/v1"
+	"github.com/emunet/emunet-operator/master/controller/internal/controller"
+	"github.com/emunet/emunet-operator/pkg/redis"
 	// +kubebuilder:scaffold:imports
 )
 

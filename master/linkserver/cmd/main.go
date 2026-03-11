@@ -14,8 +14,8 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
-	"emunet/linkserver/internal/api"
-	"emunet/linkserver/internal/redis"
+	"github.com/emunet/emunet-operator/master/linkserver/internal/api"
+	"github.com/emunet/emunet-operator/pkg/redis"
 )
 
 func main() {

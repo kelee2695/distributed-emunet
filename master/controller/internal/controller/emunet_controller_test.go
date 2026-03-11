@@ -27,7 +27,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	emunetv1 "emunet/controller/api/v1"
+	emunetv1 "github.com/emunet/emunet-operator/master/controller/api/v1"
 )
 
 var _ = Describe("EmuNet Controller", func() {
