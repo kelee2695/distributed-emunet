@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: emunet-ebpf-agent
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      name: emunet-ebpf-agent
+  template:
+    metadata:
+      labels:
+        name: emunet-ebpf-agent
+    spec:
+      tolerations:
+      - key: dedicated
+        operator: Equal
+        value: emu-master
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/master
+        operator: Exists
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      
+      hostNetwork: true
+      
+      initContainers:
+        - name: install-cni
+          image: 100.75.179.29:5000/emunet-node-agent:latest
+          imagePullPolicy: Always
+          command: ["/install-cni.sh"]
+          volumeMounts:
+          - name: cni-bin-dir
+            mountPath: /opt/cni/bin
+          - name: cni-conf-dir
+            mountPath: /etc/cni/net.d
+
+      containers:
+      - name: node-agent
+        image: 100.75.179.29:5000/emunet-node-agent:latest
+        imagePullPolicy: Always
+        command: ["/node-agent"]
+        args: ["-redis-addr=100.75.179.29:6379", "-node-name=$(MY_NODE_NAME)"]
+        env:
+        - name: MY_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: sys
+          mountPath: /sys
+        - name: bpf-fs
+          mountPath: /sys/fs/bpf
+        - name: modules
+          mountPath: /lib/modules
+          readOnly: true
+
+      volumes:
+      - name: cni-bin-dir
+        hostPath:
+          path: /opt/cni/bin
+          type: DirectoryOrCreate
+      - name: cni-conf-dir
+        hostPath:
+          path: /etc/cni/net.d
+      - name: sys
+        hostPath:
+          path: /sys
+      - name: bpf-fs
+        hostPath:
+          path: /sys/fs/bpf
+          type: DirectoryOrCreate
+      - name: modules
+        hostPath:
+          path: /lib/modules

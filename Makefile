@@ -5,9 +5,11 @@ GO := go
 GOFLAGS := -v
 LDFLAGS := -s -w
 
-VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+VERSION := latest
 BUILD_TIME := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+
+REGISTRY := 100.75.179.29:5000
 
 LDFLAGS += -X main.Version=$(VERSION) -X main.BuildTime=$(BUILD_TIME) -X main.GitCommit=$(GIT_COMMIT)
 
@@ -81,6 +83,8 @@ help:
 	@echo "  make deploy-controller - Deploy controller to Kubernetes"
 	@echo "  make deploy-linkserver - Deploy linkserver to Kubernetes"
 	@echo "  make deploy-node-agent - Deploy node-agent to Kubernetes"
+	@echo ""
+	@echo "  make clean-registry   - Clear all emunet images from registry"
 
 build: controller linkserver node-agent emu-cni debug-cni emunet-gen
 
@@ -175,26 +179,26 @@ docker-build: docker-build-controller docker-build-linkserver docker-build-node-
 
 docker-build-controller:
 	@echo "Building controller Docker image..."
-	docker build -t emunet-controller:$(VERSION) -f $(DEPLOY_CONTROLLER)/Dockerfile .
+	docker build -t $(REGISTRY)/emunet-controller:$(VERSION) -f $(DEPLOY_CONTROLLER)/Dockerfile .
 
 docker-build-linkserver:
 	@echo "Building linkserver Docker image..."
-	docker build -t emunet-linkserver:$(VERSION) -f $(DEPLOY_LINKSERVER)/Dockerfile .
+	docker build -t $(REGISTRY)/emunet-linkserver:$(VERSION) -f $(DEPLOY_LINKSERVER)/Dockerfile .
 
 docker-build-node-agent:
 	@echo "Building node-agent Docker image..."
-	docker build -t emunet-node-agent:$(VERSION) -f $(DEPLOY_NODE_AGENT)/Dockerfile .
+	docker build -t $(REGISTRY)/emunet-node-agent:$(VERSION) -f $(DEPLOY_NODE_AGENT)/Dockerfile .
 
 docker-push: docker-push-controller docker-push-linkserver docker-push-node-agent
 
 docker-push-controller:
-	docker push emunet-controller:$(VERSION)
+	docker push $(REGISTRY)/emunet-controller:$(VERSION)
 
 docker-push-linkserver:
-	docker push emunet-linkserver:$(VERSION)
+	docker push $(REGISTRY)/emunet-linkserver:$(VERSION)
 
 docker-push-node-agent:
-	docker push emunet-node-agent:$(VERSION)
+	docker push $(REGISTRY)/emunet-node-agent:$(VERSION)
 
 deploy: deploy-controller deploy-linkserver deploy-node-agent
 
@@ -210,6 +214,33 @@ deploy-linkserver:
 deploy-node-agent:
 	@echo "Deploying node-agent to Kubernetes..."
 	kubectl apply -f $(DEPLOY_NODE_AGENT)/
+
+clean-registry:
+	@echo "======================================"
+	@echo "Clearing all images from registry"
+	@echo "Registry container: private-registry"
+	@echo "======================================"
+	@if ! docker ps | grep -q "private-registry"; then \
+		echo "Error: Registry container 'private-registry' is not running"; \
+		exit 1; \
+	fi
+	@MOUNT_PATH=$$(docker inspect private-registry --format='{{range .Mounts}}{{if eq .Destination "/var/lib/registry"}}{{.Source}}{{end}}{{end}}'); \
+	if [ -z "$$MOUNT_PATH" ]; then \
+		echo "Error: Cannot find registry data mount path"; \
+		exit 1; \
+	fi; \
+	echo "Registry data path: $$MOUNT_PATH"; \
+	echo ""; \
+	echo "Stopping registry container..."; \
+	docker stop private-registry; \
+	echo "Deleting registry data..."; \
+	rm -rf "$$MOUNT_PATH/docker/registry/v2/repositories/emunet"; \
+	echo "Starting registry container..."; \
+	docker start private-registry; \
+	echo ""; \
+	echo "======================================"; \
+	echo "Cleanup completed!"; \
+	echo "======================================"
 
 install-deps:
 	@echo "Installing dependencies..."
