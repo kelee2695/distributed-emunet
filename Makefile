@@ -1,4 +1,4 @@
-.PHONY: all build clean test docker-build docker-push help controller linkserver node-agent emu-cni debug-cni emunet-gen
+.PHONY: all build clean test docker-build docker-push help controller linkserver node-agent emu-cni debug-cni emunet-gen deploy undeploy deploy-coredns undeploy-coredns deploy-redis deploy-controller deploy-linkserver deploy-node-agent undeploy-redis undeploy-controller undeploy-linkserver undeploy-node-agent
 
 BINARY_DIR := bin
 GO := go
@@ -43,6 +43,8 @@ CONTROLLER_BOILERPLATE := ./$(CONTROLLER_DIR)/hack/boilerplate.go.txt
 CONTROLLER_PKG := ./$(CONTROLLER_DIR)/...
 
 DEPLOY_CRDS := ./$(DEPLOY_DIR)/crds
+DEPLOY_COREDNS := ./$(DEPLOY_DIR)/coredns
+DEPLOY_REDIS := ./$(DEPLOY_DIR)/redis
 DEPLOY_CONTROLLER := ./$(DEPLOY_DIR)/controller
 DEPLOY_LINKSERVER := ./$(DEPLOY_DIR)/linkserver
 DEPLOY_NODE_AGENT := ./$(DEPLOY_DIR)/emunet-node-agent
@@ -77,12 +79,24 @@ help:
 	@echo "  make controller-gen   - Download controller-gen tool"
 	@echo ""
 	@echo "  make docker-build      - Build all Docker images"
+	@echo "  make docker-build-coredns - Build CoreDNS Docker image (pull and tag)"
 	@echo "  make docker-push       - Push all Docker images"
+	@echo "  make docker-push-coredns - Push CoreDNS Docker image"
 	@echo ""
-	@echo "  make deploy           - Deploy all components to Kubernetes"
-	@echo "  make deploy-controller - Deploy controller to Kubernetes"
-	@echo "  make deploy-linkserver - Deploy linkserver to Kubernetes"
-	@echo "  make deploy-node-agent - Deploy node-agent to Kubernetes"
+	@echo "  make deploy-coredns    - Deploy CoreDNS to Kubernetes (DNS service for service discovery)"
+	@echo "  make undeploy-coredns  - Undeploy CoreDNS from Kubernetes"
+	@echo ""
+	@echo "  make deploy            - Deploy all components to Kubernetes (redis -> controller -> linkserver -> node-agent)"
+	@echo "  make deploy-redis      - Deploy redis to Kubernetes"
+	@echo "  make deploy-controller  - Deploy controller to Kubernetes"
+	@echo "  make deploy-linkserver  - Deploy linkserver to Kubernetes"
+	@echo "  make deploy-node-agent  - Deploy node-agent to Kubernetes"
+	@echo ""
+	@echo "  make undeploy          - Undeploy all components from Kubernetes (node-agent -> linkserver -> controller -> redis)"
+	@echo "  make undeploy-redis    - Undeploy redis from Kubernetes"
+	@echo "  make undeploy-controller - Undeploy controller from Kubernetes"
+	@echo "  make undeploy-linkserver - Undeploy linkserver from Kubernetes"
+	@echo "  make undeploy-node-agent - Undeploy node-agent from Kubernetes"
 	@echo ""
 	@echo "  make clean-registry   - Clear all emunet images from registry"
 
@@ -175,7 +189,7 @@ $(CONTROLLER_GEN): $(LOCALBIN)
 $(LOCALBIN):
 	@mkdir -p $(LOCALBIN)
 
-docker-build: docker-build-controller docker-build-linkserver docker-build-node-agent
+docker-build: docker-build-controller docker-build-linkserver docker-build-node-agent docker-build-coredns
 
 docker-build-controller:
 	@echo "Building controller Docker image..."
@@ -189,7 +203,12 @@ docker-build-node-agent:
 	@echo "Building node-agent Docker image..."
 	docker build -t $(REGISTRY)/emunet-node-agent:$(VERSION) -f $(DEPLOY_NODE_AGENT)/Dockerfile .
 
-docker-push: docker-push-controller docker-push-linkserver docker-push-node-agent
+docker-build-coredns:
+	@echo "Building CoreDNS Docker image..."
+	docker pull coredns/coredns:1.10.1
+	docker tag coredns/coredns:1.10.1 $(REGISTRY)/coredns:1.10.1
+
+docker-push: docker-push-controller docker-push-linkserver docker-push-node-agent docker-push-coredns
 
 docker-push-controller:
 	docker push $(REGISTRY)/emunet-controller:$(VERSION)
@@ -200,9 +219,18 @@ docker-push-linkserver:
 docker-push-node-agent:
 	docker push $(REGISTRY)/emunet-node-agent:$(VERSION)
 
-deploy: deploy-controller deploy-linkserver deploy-node-agent
+docker-push-coredns:
+	@echo "Pushing CoreDNS Docker image..."
+	docker push $(REGISTRY)/coredns:1.10.1
 
-deploy-controller:
+deploy: deploy-redis deploy-controller deploy-linkserver deploy-node-agent
+
+deploy-redis:
+	@echo "Deploying redis to Kubernetes..."
+	kubectl apply -f $(DEPLOY_REDIS)/emunet-redis-deployment.yaml
+	kubectl apply -f $(DEPLOY_REDIS)/emunet-redis-service.yaml
+
+deploy-controller: deploy-redis
 	@echo "Deploying controller to Kubernetes..."
 	kubectl apply -f $(DEPLOY_CRDS)/
 	kubectl apply -f $(DEPLOY_CONTROLLER)/
@@ -214,6 +242,42 @@ deploy-linkserver:
 deploy-node-agent:
 	@echo "Deploying node-agent to Kubernetes..."
 	kubectl apply -f $(DEPLOY_NODE_AGENT)/
+
+undeploy: undeploy-node-agent undeploy-linkserver undeploy-controller undeploy-redis
+
+undeploy-node-agent:
+	@echo "Undeploying node-agent from Kubernetes..."
+	kubectl delete -f $(DEPLOY_NODE_AGENT)/ --ignore-not-found=true
+
+undeploy-linkserver:
+	@echo "Undeploying linkserver from Kubernetes..."
+	kubectl delete -f $(DEPLOY_LINKSERVER)/ --ignore-not-found=true
+
+undeploy-controller:
+	@echo "Undeploying controller from Kubernetes..."
+	kubectl delete -f $(DEPLOY_CONTROLLER)/ --ignore-not-found=true
+	kubectl delete -f $(DEPLOY_CRDS)/ --ignore-not-found=true
+
+undeploy-redis:
+	@echo "Undeploying redis from Kubernetes..."
+	kubectl delete -f $(DEPLOY_REDIS)/emunet-redis-deployment.yaml --ignore-not-found=true
+	kubectl delete -f $(DEPLOY_REDIS)/emunet-redis-service.yaml --ignore-not-found=true
+
+deploy-coredns:
+	@echo "Deploying CoreDNS to Kubernetes..."
+	kubectl apply -f $(DEPLOY_COREDNS)/coredns-rbac.yaml
+	kubectl apply -f $(DEPLOY_COREDNS)/coredns-configmap.yaml
+	kubectl apply -f $(DEPLOY_COREDNS)/coredns-deployment.yaml
+	kubectl apply -f $(DEPLOY_COREDNS)/coredns-service.yaml
+	@echo "CoreDNS deployed successfully!"
+
+undeploy-coredns:
+	@echo "Undeploying CoreDNS from Kubernetes..."
+	kubectl delete -f $(DEPLOY_COREDNS)/coredns-service.yaml --ignore-not-found=true
+	kubectl delete -f $(DEPLOY_COREDNS)/coredns-deployment.yaml --ignore-not-found=true
+	kubectl delete -f $(DEPLOY_COREDNS)/coredns-configmap.yaml --ignore-not-found=true
+	kubectl delete -f $(DEPLOY_COREDNS)/coredns-rbac.yaml --ignore-not-found=true
+	@echo "CoreDNS undeployed successfully!"
 
 clean-registry:
 	@echo "======================================"

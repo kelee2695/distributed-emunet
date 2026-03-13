@@ -123,7 +123,7 @@ spec:
             - --leader-elect
             - --health-probe-bind-address=:8081
             - --metrics-bind-address=:8443
-            - --redis-addr=100.75.179.29:6379
+            - --redis-addr=emunet-redis.kube-system:6379
           
           resources:
             limits:

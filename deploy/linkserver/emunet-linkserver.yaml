@@ -18,17 +18,6 @@ spec:
       labels:
         app: emunet-linkserver
     spec:
-      hostAliases:
-        - ip: "100.75.179.29"
-          hostnames:
-            - "k8s-master01"
-        - ip: "100.115.244.45"
-          hostnames:
-            - "k8s-node01"
-        - ip: "100.90.181.123"
-          hostnames:
-            - "njuee"
-
       # 强制调度到 Master 节点
       nodeSelector:
         node-role.kubernetes.io/master: ""
@@ -56,7 +45,7 @@ spec:
             # 绑定 0.0.0.0 才能被外部访问
             - --api-bind-address=:8082
             # 【注意】Redis 地址
-            - --redis-addr=100.75.179.29:6379
+            - --redis-addr=emunet-redis.kube-system:6379
           
           ports:
             - containerPort: 8082

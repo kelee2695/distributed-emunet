@@ -24,7 +24,7 @@ spec:
         operator: Exists
         effect: NoSchedule
       
-      hostNetwork: true
+      dnsPolicy: ClusterFirst
       
       initContainers:
         - name: install-cni
@@ -42,22 +42,21 @@ spec:
         image: 100.75.179.29:5000/emunet-node-agent:latest
         imagePullPolicy: Always
         command: ["/node-agent"]
-        args: ["-redis-addr=100.75.179.29:6379", "-node-name=$(MY_NODE_NAME)"]
+        args: ["-redis-addr=emunet-redis.kube-system:6379", "-node-name=$(MY_NODE_NAME)"]
         env:
         - name: MY_NODE_NAME
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        ports:
+        - containerPort: 12345
+          hostPort: 12345
+          protocol: TCP
         securityContext:
           privileged: true
         volumeMounts:
-        - name: sys
-          mountPath: /sys
         - name: bpf-fs
           mountPath: /sys/fs/bpf
-        - name: modules
-          mountPath: /lib/modules
-          readOnly: true
 
       volumes:
       - name: cni-bin-dir
@@ -67,13 +66,7 @@ spec:
       - name: cni-conf-dir
         hostPath:
           path: /etc/cni/net.d
-      - name: sys
-        hostPath:
-          path: /sys
       - name: bpf-fs
         hostPath:
           path: /sys/fs/bpf
           type: DirectoryOrCreate
-      - name: modules
-        hostPath:
-          path: /lib/modules

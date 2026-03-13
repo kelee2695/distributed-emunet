@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: emunet-redis
+  namespace: kube-system
+  labels:
+    app: emunet-redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: emunet-redis
+  template:
+    metadata:
+      labels:
+        app: emunet-redis
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/master: ""
+      
+      tolerations:
+        - key: "node-role.kubernetes.io/master"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "dedicated"
+          operator: "Equal"
+          value: "emu-master"
+          effect: "NoSchedule"
+      
+      containers:
+        - name: redis
+          image: 100.75.179.29:5000/redis:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 6379
+              name: redis
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          livenessProbe:
+            exec:
+              command:
+                - redis-cli
+                - ping
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command:
+                - redis-cli
+                - ping
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+      volumes:
+        - name: redis-data
+          emptyDir: {}
