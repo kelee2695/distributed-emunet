@@ -27,7 +27,7 @@ curl -X POST http://localhost:30082/api/v1/ebpf/entry/by-pods \
   -H "Content-Type: application/json" \
   -d '{
     "pod1": "emunet-example-group0-0",
-    "pod2": "emunet-example-group0-10",
+    "pod2": "emunet-example-group0-993",
     "throttleRateBps": 1000000,
     "delay": 1000,
     "lossRate": 2500,
@@ -38,5 +38,5 @@ curl -X DELETE http://localhost:30082/api/v1/ebpf/entry/by-pods \
   -H "Content-Type: application/json" \
   -d '{
     "pod1": "emunet-example-group0-0",
-    "pod2": "emunet-example-group0-10"  
+    "pod2": "emunet-example-group0-993"  
   }'

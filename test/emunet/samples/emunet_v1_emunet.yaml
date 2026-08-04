@@ -9,7 +9,5 @@ spec:
     matchLabels:
       app: emunet-pod
   imageGroups:
-    - image: nginx:alpine
-      replicas: 18
-    - image: k8s.gcr.io/pause:3.2
-      replicas: 2
+    - image: 100.75.179.29:5000/busybox-ping:1.36
+      replicas: 1000
