@@ -185,6 +185,63 @@
             </table>
           </div>
         </div>
+
+        <div class="panel topology-panel">
+          <div class="panel-head">
+            <div>
+              <h2>拓扑规则</h2>
+              <p id="topology-summary">按空间位置生成链路参数并批量下发</p>
+            </div>
+            <span id="topology-status" class="pill muted">就绪</span>
+          </div>
+          <div class="topology-controls">
+            <label>
+              <span>网络规则</span>
+              <select id="topology-rule">
+                <option value="grid">网格邻接</option>
+                <option value="ring">环形相邻</option>
+                <option value="nearest">空间 k 近邻</option>
+              </select>
+            </label>
+            <label>
+              <span>节点上限</span>
+              <input id="topology-node-limit" type="number" min="2" max="1000" step="1" value="200" />
+            </label>
+            <label>
+              <span>k 近邻</span>
+              <input id="topology-neighbors" type="number" min="1" max="12" step="1" value="4" />
+            </label>
+            <label>
+              <span>基础延迟 0.01ms</span>
+              <input id="topology-base-delay" type="number" min="0" step="1" value="100" />
+            </label>
+            <label>
+              <span>距离延迟 0.01ms</span>
+              <input id="topology-distance-delay" type="number" min="0" step="1" value="2000" />
+            </label>
+            <label>
+              <span>最大丢包 0.01%</span>
+              <input id="topology-max-loss" type="number" min="0" max="10000" step="1" value="200" />
+            </label>
+            <label>
+              <span>抖动系数 0.01ms</span>
+              <input id="topology-jitter-scale" type="number" min="0" step="1" value="200" />
+            </label>
+            <label>
+              <span>带宽 bps</span>
+              <input id="topology-bandwidth" type="number" min="0" step="1" value="0" />
+            </label>
+          </div>
+          <div class="actions">
+            <button id="load-topology-pods">加载节点</button>
+            <button id="preview-topology">生成预览</button>
+            <button id="apply-topology" class="primary">下发拓扑规则</button>
+            <button id="cancel-topology" class="danger">停止下发</button>
+          </div>
+          <div class="topology-canvas-wrap">
+            <canvas id="topology-canvas" width="1200" height="520"></canvas>
+          </div>
+        </div>
       </section>
     </main>
 

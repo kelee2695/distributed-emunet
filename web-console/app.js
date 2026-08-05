@@ -46,6 +46,21 @@ const el = {
   runPing: document.querySelector("#run-ping"),
   pingStatus: document.querySelector("#ping-status"),
   pingOutput: document.querySelector("#ping-output"),
+  topologyRule: document.querySelector("#topology-rule"),
+  topologyNodeLimit: document.querySelector("#topology-node-limit"),
+  topologyNeighbors: document.querySelector("#topology-neighbors"),
+  topologyBaseDelay: document.querySelector("#topology-base-delay"),
+  topologyDistanceDelay: document.querySelector("#topology-distance-delay"),
+  topologyMaxLoss: document.querySelector("#topology-max-loss"),
+  topologyJitterScale: document.querySelector("#topology-jitter-scale"),
+  topologyBandwidth: document.querySelector("#topology-bandwidth"),
+  loadTopologyPods: document.querySelector("#load-topology-pods"),
+  previewTopology: document.querySelector("#preview-topology"),
+  applyTopology: document.querySelector("#apply-topology"),
+  cancelTopology: document.querySelector("#cancel-topology"),
+  topologyCanvas: document.querySelector("#topology-canvas"),
+  topologyStatus: document.querySelector("#topology-status"),
+  topologySummary: document.querySelector("#topology-summary"),
 };
 
 let pods = [];
@@ -59,6 +74,10 @@ let podPage = {
   limit: 100,
   total: 0,
 };
+let topologyPods = [];
+let topologyNodes = [];
+let topologyEdges = [];
+let topologyCancelled = false;
 
 function init() {
   const sameOriginUrl = window.location.protocol.startsWith("http") ? window.location.origin : el.linkserverUrl.value;
@@ -87,6 +106,18 @@ function init() {
   el.applyRule.addEventListener("click", applyRule);
   el.deleteRule.addEventListener("click", deleteRule);
   el.runPing.addEventListener("click", runPing);
+  el.loadTopologyPods.addEventListener("click", loadTopologyPods);
+  el.previewTopology.addEventListener("click", previewTopology);
+  el.applyTopology.addEventListener("click", applyTopology);
+  el.cancelTopology.addEventListener("click", () => {
+    topologyCancelled = true;
+    setPill(el.topologyStatus, "停止中", "warn");
+  });
+  window.addEventListener("resize", () => {
+    if (topologyNodes.length) {
+      drawTopology();
+    }
+  });
 
   saveConfig();
   checkHealth();
@@ -183,6 +214,7 @@ async function startEmuNet() {
     saveConfig();
     await refreshEmuNets();
     clearPodDetails("Pod 详情未加载；自动刷新只更新摘要");
+    clearTopology("实例已更新，请重新加载拓扑节点");
     await refreshSummary();
   } catch (err) {
     el.emunetStatus.textContent = shortError(err);
@@ -204,6 +236,7 @@ async function stopEmuNet() {
   try {
     const payload = await api(`/api/v1/emunets/${ns}/${name}/stop`, { method: "POST" });
     const deletingPods = Number(payload.data?.deletingPods || 0);
+    clearTopology("实例正在关闭，拓扑预览已清空");
     startStopProgress(ns, name, deletingPods);
     await refreshEmuNets();
   } catch (err) {
@@ -474,6 +507,300 @@ function renderPodSelects() {
   }
 }
 
+function clearTopology(message) {
+  topologyPods = [];
+  topologyNodes = [];
+  topologyEdges = [];
+  topologyCancelled = true;
+  drawTopology();
+  setPill(el.topologyStatus, "就绪", "muted");
+  el.topologySummary.textContent = message || "按空间位置生成链路参数并批量下发";
+}
+
+async function loadTopologyPods() {
+  saveConfig();
+  setPill(el.topologyStatus, "加载中", "muted");
+  el.topologySummary.textContent = "正在分页读取 Pod 详情";
+  try {
+    topologyPods = await fetchAllUsablePods(numberValue(el.topologyNodeLimit) || 200);
+    topologyNodes = layoutTopologyNodes(topologyPods, el.topologyRule.value);
+    topologyEdges = [];
+    drawTopology();
+    setPill(el.topologyStatus, "已加载", "ok");
+    el.topologySummary.textContent = `已加载 ${topologyPods.length} 个可配置 Pod`;
+    return true;
+  } catch (err) {
+    setPill(el.topologyStatus, shortError(err), "bad");
+    el.topologySummary.textContent = err?.message || String(err);
+    return false;
+  }
+}
+
+async function fetchAllUsablePods(limit) {
+  const ns = encodeURIComponent(el.namespace.value.trim() || "default");
+  const name = encodeURIComponent(el.emunetName.value.trim());
+  if (!name) {
+    throw new Error("请选择 EmuNet");
+  }
+  const pageLimit = 500;
+  let offset = 0;
+  let total = Infinity;
+  const result = [];
+  while (offset < total && result.length < limit) {
+    const payload = await api(`/api/v1/emunets/${ns}/${name}/pods?offset=${offset}&limit=${pageLimit}`);
+    const data = payload.data || {};
+    const items = Array.isArray(data.items) ? data.items : Array.isArray(data) ? data : [];
+    total = Number(data.total || items.length || 0);
+    for (const pod of items) {
+      if (pod.podName && pod.nodeName && pod.macAddress && pod.vethIfIndex) {
+        result.push(pod);
+        if (result.length >= limit) {
+          break;
+        }
+      }
+    }
+    offset += pageLimit;
+    if (!items.length) {
+      break;
+    }
+  }
+  if (result.length < 2) {
+    throw new Error("可配置 Pod 不足 2 个，请等待 MAC 同步");
+  }
+  return result.sort((a, b) => String(a.podName).localeCompare(String(b.podName)));
+}
+
+async function previewTopology() {
+  if (!topologyPods.length) {
+    const loaded = await loadTopologyPods();
+    if (!loaded) {
+      return false;
+    }
+  }
+  topologyNodes = layoutTopologyNodes(topologyPods, el.topologyRule.value);
+  topologyEdges = buildTopologyEdges(topologyNodes, el.topologyRule.value);
+  drawTopology();
+  setPill(el.topologyStatus, "预览完成", "ok");
+  el.topologySummary.textContent = `${topologyNodes.length} 个节点，${topologyEdges.length} 条链路`;
+  return true;
+}
+
+function layoutTopologyNodes(podList, rule) {
+  const n = podList.length;
+  if (rule === "ring") {
+    return podList.map((pod, index) => {
+      const angle = (2 * Math.PI * index) / n - Math.PI / 2;
+      return {
+        pod,
+        x: 0.5 + 0.42 * Math.cos(angle),
+        y: 0.5 + 0.42 * Math.sin(angle),
+      };
+    });
+  }
+  if (rule === "nearest") {
+    return podList.map((pod) => {
+      const h1 = hashText(`${pod.podName}:x`);
+      const h2 = hashText(`${pod.podName}:y`);
+      return {
+        pod,
+        x: 0.08 + (h1 / 0xffffffff) * 0.84,
+        y: 0.08 + (h2 / 0xffffffff) * 0.84,
+      };
+    });
+  }
+  const cols = Math.ceil(Math.sqrt(n));
+  const rows = Math.ceil(n / cols);
+  return podList.map((pod, index) => {
+    const col = index % cols;
+    const row = Math.floor(index / cols);
+    return {
+      pod,
+      gridCol: col,
+      gridRow: row,
+      x: cols <= 1 ? 0.5 : 0.06 + (col / (cols - 1)) * 0.88,
+      y: rows <= 1 ? 0.5 : 0.08 + (row / (rows - 1)) * 0.84,
+    };
+  });
+}
+
+function buildTopologyEdges(nodes, rule) {
+  if (nodes.length < 2) {
+    return [];
+  }
+  const edges = [];
+  if (rule === "ring") {
+    for (let i = 0; i < nodes.length; i++) {
+      edges.push(makeTopologyEdge(nodes[i], nodes[(i + 1) % nodes.length]));
+    }
+    return edges;
+  }
+  if (rule === "nearest") {
+    const k = Math.min(numberValue(el.topologyNeighbors) || 4, nodes.length - 1);
+    const seen = new Set();
+    for (const source of nodes) {
+      const nearest = nodes
+        .filter((target) => target !== source)
+        .map((target) => ({ target, distance: nodeDistance(source, target) }))
+        .sort((a, b) => a.distance - b.distance)
+        .slice(0, k);
+      for (const item of nearest) {
+        const key = edgeKey(source, item.target);
+        if (!seen.has(key)) {
+          seen.add(key);
+          edges.push(makeTopologyEdge(source, item.target));
+        }
+      }
+    }
+    return edges;
+  }
+  const byCell = new Map(nodes.map((node) => [`${node.gridCol},${node.gridRow}`, node]));
+  for (const node of nodes) {
+    for (const [dc, dr] of [
+      [1, 0],
+      [0, 1],
+    ]) {
+      const next = byCell.get(`${node.gridCol + dc},${node.gridRow + dr}`);
+      if (next) {
+        edges.push(makeTopologyEdge(node, next));
+      }
+    }
+  }
+  return edges;
+}
+
+function makeTopologyEdge(a, b) {
+  const distance = nodeDistance(a, b);
+  const baseDelay = numberValue(el.topologyBaseDelay);
+  const distanceDelay = numberValue(el.topologyDistanceDelay);
+  const maxLoss = numberValue(el.topologyMaxLoss);
+  const jitterScale = numberValue(el.topologyJitterScale);
+  return {
+    a,
+    b,
+    distance,
+    params: {
+      throttleRateBps: numberValue(el.topologyBandwidth),
+      delay: Math.round(baseDelay + distance * distanceDelay),
+      lossRate: Math.min(maxLoss, Math.round(distance * distance * maxLoss)),
+      jitter: Math.round(distance * jitterScale),
+    },
+  };
+}
+
+async function applyTopology() {
+  if (!topologyEdges.length) {
+    const ready = await previewTopology();
+    if (!ready) {
+      return;
+    }
+  }
+  if (topologyEdges.length > 5000) {
+    setPill(el.topologyStatus, "链路过多", "bad");
+    el.topologySummary.textContent = "一次最多下发 5000 条链路，请降低节点上限或 k 值";
+    return;
+  }
+  topologyCancelled = false;
+  el.applyTopology.disabled = true;
+  setPill(el.topologyStatus, "下发中", "muted");
+  try {
+    const result = await runTopologyJobs(topologyEdges, 4, async (edge) => {
+      if (topologyCancelled) {
+        return false;
+      }
+      await api("/api/v1/ebpf/entry/by-pods", {
+        method: "POST",
+        body: JSON.stringify({
+          pod1: edge.a.pod.podName,
+          pod2: edge.b.pod.podName,
+          ...edge.params,
+        }),
+      });
+      return true;
+    });
+    setPill(el.topologyStatus, topologyCancelled ? "已停止" : "已下发", topologyCancelled ? "warn" : "ok");
+    el.topologySummary.textContent = `成功 ${result.success}/${topologyEdges.length} 条，失败 ${result.failed} 条`;
+  } catch (err) {
+    setPill(el.topologyStatus, shortError(err), "bad");
+    el.topologySummary.textContent = err?.message || String(err);
+  } finally {
+    el.applyTopology.disabled = false;
+  }
+}
+
+async function runTopologyJobs(items, concurrency, worker) {
+  let cursor = 0;
+  let success = 0;
+  let failed = 0;
+  async function next() {
+    while (cursor < items.length && !topologyCancelled) {
+      const index = cursor++;
+      try {
+        const applied = await worker(items[index]);
+        if (applied) {
+          success++;
+        }
+      } catch {
+        failed++;
+      }
+      if ((success + failed) % 20 === 0 || success + failed === items.length) {
+        el.topologySummary.textContent = `下发 ${success + failed}/${items.length} 条，成功 ${success}，失败 ${failed}`;
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, next));
+  return { success, failed };
+}
+
+function drawTopology() {
+  const canvas = el.topologyCanvas;
+  const ctx = canvas.getContext("2d");
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+  canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, rect.width, rect.height);
+  ctx.fillStyle = "#f9faf8";
+  ctx.fillRect(0, 0, rect.width, rect.height);
+
+  const width = rect.width;
+  const height = rect.height;
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = "rgba(23, 111, 100, 0.22)";
+  for (const edge of topologyEdges.slice(0, 6000)) {
+    ctx.beginPath();
+    ctx.moveTo(edge.a.x * width, edge.a.y * height);
+    ctx.lineTo(edge.b.x * width, edge.b.y * height);
+    ctx.stroke();
+  }
+
+  const radius = topologyNodes.length > 500 ? 2.1 : topologyNodes.length > 200 ? 2.8 : 4;
+  for (const node of topologyNodes) {
+    ctx.beginPath();
+    ctx.fillStyle = node.pod.ready ? "#176f64" : "#9a6500";
+    ctx.arc(node.x * width, node.y * height, radius, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function nodeDistance(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function edgeKey(a, b) {
+  const names = [a.pod.podName, b.pod.podName].sort();
+  return `${names[0]}|${names[1]}`;
+}
+
+function hashText(text) {
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
 function renderEmuNetList() {
   if (!emunets.length) {
     el.emunetList.innerHTML = `<div class="empty block">暂无实例</div>`;
@@ -512,6 +839,7 @@ function selectEmuNet(namespace, name) {
   saveConfig();
   renderEmuNetList();
   clearPodDetails("Pod 详情未加载；自动刷新只更新摘要");
+  clearTopology("实例已切换，请重新加载拓扑节点");
   refreshSummary();
 }
 
