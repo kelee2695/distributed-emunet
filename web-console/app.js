@@ -355,8 +355,24 @@ function renderSummary(summary) {
   el.metricMac.textContent = String(summary.macSyncedReplicas || 0);
   el.metricNodes.textContent = String(summary.nodeCount || 0);
   if (summary.desiredReplicas || summary.readyReplicas) {
-    el.podSummary.textContent = `${summary.readyReplicas || 0}/${summary.desiredReplicas || 0} Ready, ${summary.macSyncedReplicas || 0} MAC synced`;
+    const age = summaryAgeText(summary.lastUpdated);
+    el.podSummary.textContent = `${summary.readyReplicas || 0}/${summary.desiredReplicas || 0} Ready, ${summary.macSyncedReplicas || 0} MAC synced${age ? `, ${age}` : ""}`;
   }
+}
+
+function summaryAgeText(lastUpdated) {
+  if (!lastUpdated) {
+    return "";
+  }
+  const updatedAt = Date.parse(lastUpdated);
+  if (!Number.isFinite(updatedAt)) {
+    return "";
+  }
+  const ageSeconds = Math.max(0, Math.round((Date.now() - updatedAt) / 1000));
+  if (ageSeconds < 60) {
+    return `${ageSeconds}s 前更新`;
+  }
+  return `${Math.floor(ageSeconds / 60)}m${ageSeconds % 60}s 前更新`;
 }
 
 function mergeSummaryIntoSelected(summary) {

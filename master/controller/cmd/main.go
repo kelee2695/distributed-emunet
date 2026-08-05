@@ -70,6 +70,7 @@ func main() {
 	var podCreateBatchSize int
 	var podDeleteBatchSize int
 	var fullStatusSyncSeconds int
+	var statusPatchSeconds int
 	var maxConcurrentReconciles int
 	var tlsOpts []func(*tls.Config)
 
@@ -86,6 +87,7 @@ func main() {
 	flag.IntVar(&podCreateBatchSize, "pod-create-batch-size", 100, "Maximum pods to create per reconcile loop.")
 	flag.IntVar(&podDeleteBatchSize, "pod-delete-batch-size", 100, "Maximum pods to delete per reconcile loop.")
 	flag.IntVar(&fullStatusSyncSeconds, "full-status-sync-seconds", 15, "Minimum interval between full pod status cache writes.")
+	flag.IntVar(&statusPatchSeconds, "status-patch-seconds", 5, "Minimum interval between Kubernetes status patches while not fully ready.")
 	flag.IntVar(&maxConcurrentReconciles, "max-concurrent-reconciles", 1, "Maximum concurrent EmuNet reconciles.")
 
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
@@ -189,6 +191,7 @@ func main() {
 		PodCreateBatchSize:      podCreateBatchSize,
 		PodDeleteBatchSize:      podDeleteBatchSize,
 		FullStatusSyncPeriod:    time.Duration(fullStatusSyncSeconds) * time.Second,
+		StatusPatchPeriod:       time.Duration(statusPatchSeconds) * time.Second,
 		MaxConcurrentReconciles: maxConcurrentReconciles,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "EmuNet")

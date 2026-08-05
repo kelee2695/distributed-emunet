@@ -29,12 +29,14 @@ type EmuNetReconciler struct {
 	PodCreateBatchSize      int
 	PodDeleteBatchSize      int
 	FullStatusSyncPeriod    time.Duration
+	StatusPatchPeriod       time.Duration
 	MaxConcurrentReconciles int
 
 	statusWriteMu            sync.Mutex
 	lastFullStatusWrite      map[string]time.Time
 	lastFullStatusGeneration map[string]int64
 	lastPodFingerprint       map[string]map[string]string
+	lastStatusPatch          map[string]time.Time
 }
 
 const (
@@ -48,6 +50,7 @@ const (
 	DefaultPodCreateBatch = 100
 	DefaultPodDeleteBatch = 100
 	DefaultFullStatusSync = 15 * time.Second
+	DefaultStatusPatch    = 5 * time.Second
 )
 
 type podSyncResult struct {
@@ -203,8 +206,10 @@ func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.Em
 	newStatus.ImageGroupStatus = compactImageGroupStatus(imageGroupStatus)
 	newStatus.ObservedGen = emunet.Generation
 
-	// Only patch if something changed
-	if !equality.Semantic.DeepEqual(emunet.Status, *newStatus) {
+	// Only patch if something changed. Redis summary is the fast status path; K8s
+	// status is throttled to avoid hammering the apiserver during large startups.
+	isFullyReady := (totalReady == desiredReplicas) && allMacsFound
+	if !equality.Semantic.DeepEqual(emunet.Status, *newStatus) && r.shouldPatchK8sStatus(emunet, isFullyReady) {
 		patch := client.MergeFrom(emunet.DeepCopy())
 		emunet.Status = *newStatus
 		if err := r.Status().Patch(ctx, emunet, patch); err != nil {
@@ -229,9 +234,24 @@ func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.Em
 		logger.Error(err, "failed to update redis cache")
 	}
 
-	// 判断系统是否完全就绪
-	isFullyReady := (totalReady == desiredReplicas) && allMacsFound
 	return isFullyReady, nil
+}
+
+func (r *EmuNetReconciler) shouldPatchK8sStatus(emunet *emunetv1.EmuNet, isFullyReady bool) bool {
+	r.statusWriteMu.Lock()
+	defer r.statusWriteMu.Unlock()
+
+	if r.lastStatusPatch == nil {
+		r.lastStatusPatch = map[string]time.Time{}
+	}
+
+	key := fmt.Sprintf("%s/%s", emunet.Namespace, emunet.Name)
+	now := time.Now()
+	if emunet.Status.ObservedGen != emunet.Generation || isFullyReady || now.Sub(r.lastStatusPatch[key]) >= r.statusPatchPeriod() {
+		r.lastStatusPatch[key] = now
+		return true
+	}
+	return false
 }
 
 func (r *EmuNetReconciler) saveStatusToRedis(ctx context.Context, emunet *emunetv1.EmuNet, status *redis.EmuNetStatus, summary *redis.EmuNetSummary, deletedPodNames []string) error {
@@ -358,6 +378,13 @@ func (r *EmuNetReconciler) fullStatusSyncPeriod() time.Duration {
 	return DefaultFullStatusSync
 }
 
+func (r *EmuNetReconciler) statusPatchPeriod() time.Duration {
+	if r.StatusPatchPeriod > 0 {
+		return r.StatusPatchPeriod
+	}
+	return DefaultStatusPatch
+}
+
 func (r *EmuNetReconciler) handleDeletion(ctx context.Context, nn types.NamespacedName, emunet *emunetv1.EmuNet) (ctrl.Result, error) {
 	if err := r.Redis.DeleteEmuNetStatus(ctx, nn.Namespace, nn.Name); err != nil {
 		log.FromContext(ctx).Error(err, "failed to cleanup redis status")
@@ -380,6 +407,7 @@ func (r *EmuNetReconciler) forgetStatusWriteState(nn types.NamespacedName) {
 	delete(r.lastFullStatusWrite, key)
 	delete(r.lastFullStatusGeneration, key)
 	delete(r.lastPodFingerprint, key)
+	delete(r.lastStatusPatch, key)
 }
 
 // --- Helpers ---

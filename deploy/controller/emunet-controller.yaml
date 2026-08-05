@@ -129,6 +129,7 @@ spec:
             - --pod-create-batch-size=100
             - --pod-delete-batch-size=100
             - --full-status-sync-seconds=15
+            - --status-patch-seconds=5
             - --max-concurrent-reconciles=1
           
           resources:
