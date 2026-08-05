@@ -40,7 +40,7 @@ func (c *Client) GetAgentNetworkInfo(ctx context.Context, podName string) (*PodS
 	return &pod, nil
 }
 
-func (c *Client) SaveStatusBatch(ctx context.Context, emunet *EmuNetStatus, pods []PodStatus) error {
+func (c *Client) SaveStatusBatch(ctx context.Context, emunet *EmuNetStatus, pods []PodStatus, summary *EmuNetSummary) error {
 	pipe := c.client.Pipeline()
 
 	key := fmt.Sprintf("emunet:%s:%s", emunet.Namespace, emunet.Name)
@@ -49,6 +49,15 @@ func (c *Client) SaveStatusBatch(ctx context.Context, emunet *EmuNetStatus, pods
 		return err
 	}
 	pipe.Set(ctx, key, data, DefaultTTL)
+
+	if summary != nil {
+		summaryKey := fmt.Sprintf("emunet:%s:%s:summary", emunet.Namespace, emunet.Name)
+		summaryData, err := json.Marshal(summary)
+		if err != nil {
+			return err
+		}
+		pipe.Set(ctx, summaryKey, summaryData, DefaultTTL)
+	}
 
 	indexKey := fmt.Sprintf("emunet:%s:%s:pods", emunet.Namespace, emunet.Name)
 
@@ -98,6 +107,20 @@ func (c *Client) GetEmuNetStatus(ctx context.Context, namespace, name string) (*
 	return &status, nil
 }
 
+func (c *Client) GetEmuNetSummary(ctx context.Context, namespace, name string) (*EmuNetSummary, error) {
+	key := fmt.Sprintf("emunet:%s:%s:summary", namespace, name)
+	data, err := c.client.Get(ctx, key).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	var summary EmuNetSummary
+	if err := json.Unmarshal([]byte(data), &summary); err != nil {
+		return nil, err
+	}
+	return &summary, nil
+}
+
 func (c *Client) DeleteEmuNetStatus(ctx context.Context, namespace, name string) error {
 	pipe := c.client.Pipeline()
 
@@ -111,7 +134,9 @@ func (c *Client) DeleteEmuNetStatus(ctx context.Context, namespace, name string)
 	}
 
 	mainKey := fmt.Sprintf("emunet:%s:%s", namespace, name)
+	summaryKey := fmt.Sprintf("emunet:%s:%s:summary", namespace, name)
 	pipe.Del(ctx, mainKey)
+	pipe.Del(ctx, summaryKey)
 	pipe.Del(ctx, indexKey)
 
 	_, err := pipe.Exec(ctx)

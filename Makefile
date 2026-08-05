@@ -193,7 +193,7 @@ docker-build: docker-build-controller docker-build-linkserver docker-build-node-
 
 docker-build-controller:
 	@echo "Building controller Docker image..."
-	docker build -t $(REGISTRY)/emunet-controller:$(VERSION) -f $(DEPLOY_CONTROLLER)/Dockerfile .
+	docker build -t $(REGISTRY)/controller:$(VERSION) -f $(DEPLOY_CONTROLLER)/Dockerfile .
 
 docker-build-linkserver:
 	@echo "Building linkserver Docker image..."
@@ -211,7 +211,7 @@ docker-build-coredns:
 docker-push: docker-push-controller docker-push-linkserver docker-push-node-agent docker-push-coredns
 
 docker-push-controller:
-	docker push $(REGISTRY)/emunet-controller:$(VERSION)
+	docker push $(REGISTRY)/controller:$(VERSION)
 
 docker-push-linkserver:
 	docker push $(REGISTRY)/linkserver:$(VERSION)

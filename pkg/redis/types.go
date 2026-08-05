@@ -16,6 +16,18 @@ type EmuNetStatus struct {
 	LastUpdated      time.Time          `json:"lastUpdated"`
 }
 
+type EmuNetSummary struct {
+	Name              string    `json:"name"`
+	Namespace         string    `json:"namespace"`
+	DesiredReplicas   int32     `json:"desiredReplicas"`
+	ReadyReplicas     int32     `json:"readyReplicas"`
+	RunningReplicas   int32     `json:"runningReplicas"`
+	MACSyncedReplicas int32     `json:"macSyncedReplicas"`
+	NodeCount         int32     `json:"nodeCount"`
+	ObservedGen       int64     `json:"observedGen"`
+	LastUpdated       time.Time `json:"lastUpdated"`
+}
+
 type ImageGroupStatus struct {
 	Image           string      `json:"image"`
 	DesiredReplicas int32       `json:"desiredReplicas"`

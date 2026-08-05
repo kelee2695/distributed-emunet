@@ -154,22 +154,15 @@ func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.Em
 		podMap[pods.Items[i].Name] = &pods.Items[i]
 	}
 
-	// Reuse existing MAC/IfIndex info from previous status if available
-	existingPodStatusMap := make(map[string]emunetv1.PodStatus)
-	for _, group := range emunet.Status.ImageGroupStatus {
-		for _, podStatus := range group.PodStatuses {
-			existingPodStatusMap[podStatus.PodName] = podStatus
-		}
-	}
-
 	// [关键] 从 Redis 拉取最新 MAC 信息
-	imageGroupStatus, totalReady, allMacsFound := r.calculateImageGroupStatus(ctx, emunet, podMap, existingPodStatusMap)
+	imageGroupStatus, totalReady, allMacsFound := r.calculateImageGroupStatus(ctx, emunet, podMap)
+	summary := buildRedisSummary(emunet, imageGroupStatus, totalReady)
 
 	// 1. Update K8s Status (Optimistic Locking via Patch)
 	newStatus := emunet.Status.DeepCopy()
 	newStatus.ReadyReplicas = totalReady
 	newStatus.DesiredReplicas = emunet.Spec.TotalReplicas
-	newStatus.ImageGroupStatus = imageGroupStatus
+	newStatus.ImageGroupStatus = compactImageGroupStatus(imageGroupStatus)
 	newStatus.ObservedGen = emunet.Generation
 
 	// Only patch if something changed
@@ -194,7 +187,7 @@ func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.Em
 		LastUpdated:      time.Now(),
 	}
 
-	if err := r.saveStatusToRedis(ctx, redisStatus); err != nil {
+	if err := r.saveStatusToRedis(ctx, redisStatus, summary); err != nil {
 		logger.Error(err, "failed to update redis cache")
 	}
 
@@ -203,14 +196,14 @@ func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.Em
 	return isFullyReady, nil
 }
 
-func (r *EmuNetReconciler) saveStatusToRedis(ctx context.Context, status *redis.EmuNetStatus) error {
+func (r *EmuNetReconciler) saveStatusToRedis(ctx context.Context, status *redis.EmuNetStatus, summary *redis.EmuNetSummary) error {
 	var allPods []redis.PodStatus
 	for _, group := range status.ImageGroupStatus {
 		for _, pod := range group.PodStatuses {
 			allPods = append(allPods, pod)
 		}
 	}
-	return r.Redis.SaveStatusBatch(ctx, status, allPods)
+	return r.Redis.SaveStatusBatch(ctx, status, allPods, summary)
 }
 
 func (r *EmuNetReconciler) handleDeletion(ctx context.Context, nn types.NamespacedName, emunet *emunetv1.EmuNet) (ctrl.Result, error) {
@@ -229,7 +222,7 @@ func (r *EmuNetReconciler) handleDeletion(ctx context.Context, nn types.Namespac
 // --- Helpers ---
 
 // calculateImageGroupStatus 返回：Status 列表, Ready 数量, 是否所有 Running Pod 的 MAC 都找到了
-func (r *EmuNetReconciler) calculateImageGroupStatus(ctx context.Context, emunet *emunetv1.EmuNet, podMap map[string]*corev1.Pod, existingStatus map[string]emunetv1.PodStatus) ([]emunetv1.ImageGroupStatus, int32, bool) {
+func (r *EmuNetReconciler) calculateImageGroupStatus(ctx context.Context, emunet *emunetv1.EmuNet, podMap map[string]*corev1.Pod) ([]emunetv1.ImageGroupStatus, int32, bool) {
 	var imageGroupStatus []emunetv1.ImageGroupStatus
 	var totalReady int32
 	allMacsFound := true
@@ -250,12 +243,6 @@ func (r *EmuNetReconciler) calculateImageGroupStatus(ctx context.Context, emunet
 				Phase:       corev1.PodPending,
 				Ready:       false,
 				LastUpdated: metav1.Now(),
-			}
-
-			// 1. 继承旧状态
-			if old, ok := existingStatus[podName]; ok {
-				podStatus.MACAddress = old.MACAddress
-				podStatus.VethIfIndex = old.VethIfIndex
 			}
 
 			// 2. 更新 K8s 实时状态
@@ -362,6 +349,51 @@ func convertPodStatuses(k8sPods []emunetv1.PodStatus) []redis.PodStatus {
 		})
 	}
 	return redisPods
+}
+
+func compactImageGroupStatus(fullStatus []emunetv1.ImageGroupStatus) []emunetv1.ImageGroupStatus {
+	compact := make([]emunetv1.ImageGroupStatus, 0, len(fullStatus))
+	for _, group := range fullStatus {
+		compact = append(compact, emunetv1.ImageGroupStatus{
+			Image:           group.Image,
+			DesiredReplicas: group.DesiredReplicas,
+			ReadyReplicas:   group.ReadyReplicas,
+			PodStatuses:     []emunetv1.PodStatus{},
+		})
+	}
+	return compact
+}
+
+func buildRedisSummary(emunet *emunetv1.EmuNet, imageGroupStatus []emunetv1.ImageGroupStatus, totalReady int32) *redis.EmuNetSummary {
+	var runningReplicas int32
+	var macSyncedReplicas int32
+	nodes := make(map[string]struct{})
+
+	for _, group := range imageGroupStatus {
+		for _, pod := range group.PodStatuses {
+			if pod.Phase == corev1.PodRunning {
+				runningReplicas++
+			}
+			if pod.MACAddress != "" && pod.VethIfIndex != 0 {
+				macSyncedReplicas++
+			}
+			if pod.NodeName != "" {
+				nodes[pod.NodeName] = struct{}{}
+			}
+		}
+	}
+
+	return &redis.EmuNetSummary{
+		Name:              emunet.Name,
+		Namespace:         emunet.Namespace,
+		DesiredReplicas:   emunet.Spec.TotalReplicas,
+		ReadyReplicas:     totalReady,
+		RunningReplicas:   runningReplicas,
+		MACSyncedReplicas: macSyncedReplicas,
+		NodeCount:         int32(len(nodes)),
+		ObservedGen:       emunet.Generation,
+		LastUpdated:       time.Now(),
+	}
 }
 
 func isPodReady(pod *corev1.Pod) bool {

@@ -117,7 +117,7 @@ spec:
       containers:
         - name: manager
           image: 100.75.179.29:5000/controller:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           command: ["/controller"]
           args:
             - --leader-elect

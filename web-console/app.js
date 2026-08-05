@@ -262,10 +262,10 @@ function configureAutoRefresh() {
 function renderSummary(summary) {
   el.metricDesired.textContent = String(summary.desiredReplicas || 0);
   el.metricReady.textContent = String(summary.readyReplicas || 0);
-  el.metricMac.textContent = detailLoaded ? String(pods.filter((pod) => pod.macAddress).length) : "-";
-  el.metricNodes.textContent = detailLoaded ? String(new Set(pods.map((pod) => pod.nodeName).filter(Boolean)).size) : "-";
+  el.metricMac.textContent = String(summary.macSyncedReplicas || 0);
+  el.metricNodes.textContent = String(summary.nodeCount || 0);
   if (summary.desiredReplicas || summary.readyReplicas) {
-    el.podSummary.textContent = `${summary.readyReplicas || 0}/${summary.desiredReplicas || 0} Ready`;
+    el.podSummary.textContent = `${summary.readyReplicas || 0}/${summary.desiredReplicas || 0} Ready, ${summary.macSyncedReplicas || 0} MAC synced`;
   }
 }
 

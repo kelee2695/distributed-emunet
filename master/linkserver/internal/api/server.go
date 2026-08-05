@@ -89,12 +89,15 @@ type EmuNetSummary struct {
 }
 
 type EmuNetRuntimeSummary struct {
-	Namespace       string    `json:"namespace"`
-	Name            string    `json:"name"`
-	DesiredReplicas int32     `json:"desiredReplicas"`
-	ReadyReplicas   int32     `json:"readyReplicas"`
-	ObservedGen     int64     `json:"observedGen"`
-	LastUpdated     time.Time `json:"lastUpdated"`
+	Namespace         string    `json:"namespace"`
+	Name              string    `json:"name"`
+	DesiredReplicas   int32     `json:"desiredReplicas"`
+	ReadyReplicas     int32     `json:"readyReplicas"`
+	RunningReplicas   int32     `json:"runningReplicas"`
+	MACSyncedReplicas int32     `json:"macSyncedReplicas"`
+	NodeCount         int32     `json:"nodeCount"`
+	ObservedGen       int64     `json:"observedGen"`
+	LastUpdated       time.Time `json:"lastUpdated"`
 }
 
 type Response struct {
@@ -423,19 +426,22 @@ func (s *MasterServer) getEmuNet(w http.ResponseWriter, r *http.Request) {
 
 func (s *MasterServer) getEmuNetSummary(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
-	status, err := s.redis.GetEmuNetStatus(r.Context(), vars["namespace"], vars["name"])
+	summary, err := s.redis.GetEmuNetSummary(r.Context(), vars["namespace"], vars["name"])
 	if err != nil {
 		s.sendError(w, http.StatusNotFound, "EmuNet summary not found")
 		return
 	}
 
 	s.sendSuccess(w, EmuNetRuntimeSummary{
-		Namespace:       status.Namespace,
-		Name:            status.Name,
-		DesiredReplicas: status.DesiredReplicas,
-		ReadyReplicas:   status.ReadyReplicas,
-		ObservedGen:     status.ObservedGen,
-		LastUpdated:     status.LastUpdated,
+		Namespace:         summary.Namespace,
+		Name:              summary.Name,
+		DesiredReplicas:   summary.DesiredReplicas,
+		ReadyReplicas:     summary.ReadyReplicas,
+		RunningReplicas:   summary.RunningReplicas,
+		MACSyncedReplicas: summary.MACSyncedReplicas,
+		NodeCount:         summary.NodeCount,
+		ObservedGen:       summary.ObservedGen,
+		LastUpdated:       summary.LastUpdated,
 	})
 }
 
