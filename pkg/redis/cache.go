@@ -288,6 +288,42 @@ func (c *Client) GetPodInfoDirectly(ctx context.Context, podName string) (*PodSt
 	return &pod, nil
 }
 
+func (c *Client) GetPodInfoDirectlyBatch(ctx context.Context, podNames []string) (map[string]*PodStatus, error) {
+	result := make(map[string]*PodStatus, len(podNames))
+	if len(podNames) == 0 {
+		return result, nil
+	}
+
+	pipe := c.client.Pipeline()
+	cmds := make(map[string]*redis.StringCmd, len(podNames))
+	for _, podName := range podNames {
+		if podName == "" {
+			continue
+		}
+		if _, exists := cmds[podName]; exists {
+			continue
+		}
+		cmds[podName] = pipe.Get(ctx, fmt.Sprintf("pod_lookup:%s", podName))
+	}
+
+	_, err := pipe.Exec(ctx)
+	if err != nil && err != redis.Nil {
+		return nil, err
+	}
+
+	for podName, cmd := range cmds {
+		data, err := cmd.Result()
+		if err != nil {
+			continue
+		}
+		var pod PodStatus
+		if json.Unmarshal([]byte(data), &pod) == nil {
+			result[podName] = &pod
+		}
+	}
+	return result, nil
+}
+
 func (c *Client) ListPodStatuses(ctx context.Context, namespace, name string) ([]PodStatus, error) {
 	pods, _, err := c.ListPodStatusesPage(ctx, namespace, name, 0, 0)
 	return pods, err

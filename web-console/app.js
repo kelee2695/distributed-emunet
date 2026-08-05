@@ -727,22 +727,9 @@ async function applyTopology() {
   el.applyTopology.disabled = true;
   setPill(el.topologyStatus, "下发中", "muted");
   try {
-    const result = await runTopologyJobs(topologyEdges, 4, async (edge) => {
-      if (topologyCancelled) {
-        return false;
-      }
-      await api("/api/v1/ebpf/entry/by-pods", {
-        method: "POST",
-        body: JSON.stringify({
-          pod1: edge.a.pod.podName,
-          pod2: edge.b.pod.podName,
-          ...edge.params,
-        }),
-      });
-      return true;
-    });
+    const result = await postTopologyBatch(topologyEdges);
     setPill(el.topologyStatus, topologyCancelled ? "已停止" : "已下发", topologyCancelled ? "warn" : "ok");
-    el.topologySummary.textContent = `成功 ${result.success}/${topologyEdges.length} 条，失败 ${result.failed} 条`;
+    el.topologySummary.textContent = `成功 ${result.success}/${topologyEdges.length} 条，失败 ${result.failed} 条，发布 ${result.publishedCommands} 条 agent 命令`;
   } catch (err) {
     setPill(el.topologyStatus, shortError(err), "bad");
     el.topologySummary.textContent = err?.message || String(err);
@@ -815,28 +802,10 @@ async function runDynamicTopologyTick() {
       throw new Error("动态链路超过 5000 条，请降低节点上限或 k 值");
     }
     drawTopology();
-    const result = await runTopologyJobs(
-      topologyEdges,
-      4,
-      async (edge) => {
-        if (!dynamicTopologyRunning || topologyCancelled) {
-          return false;
-        }
-        await api("/api/v1/ebpf/entry/by-pods", {
-          method: "POST",
-          body: JSON.stringify({
-            pod1: edge.a.pod.podName,
-            pod2: edge.b.pod.podName,
-            ...edge.params,
-          }),
-        });
-        return true;
-      },
-      "动态",
-    );
+    const result = await postTopologyBatch(topologyEdges);
     const sample = topologyNodes[0];
     setPill(el.topologyStatus, dynamicTopologyRunning ? "动态运行中" : "已停止", dynamicTopologyRunning ? "ok" : "warn");
-    el.topologySummary.textContent = `第 ${dynamicTopologyTick} 轮：${topologyNodes.length} 节点，${topologyEdges.length} 链路，成功 ${result.success}，失败 ${result.failed}；样例坐标 ${sample.pod.podName}=(${sample.x.toFixed(3)}, ${sample.y.toFixed(3)})`;
+    el.topologySummary.textContent = `第 ${dynamicTopologyTick} 轮：${topologyNodes.length} 节点，${topologyEdges.length} 链路，成功 ${result.success}，失败 ${result.failed}，发布 ${result.publishedCommands} 条命令；样例坐标 ${sample.pod.podName}=(${sample.x.toFixed(3)}, ${sample.y.toFixed(3)})`;
   } catch (err) {
     stopDynamicTopology();
     setPill(el.topologyStatus, shortError(err), "bad");
@@ -861,6 +830,29 @@ function updateDynamicNodePositions(tick) {
   }
 }
 
+async function postTopologyBatch(edges) {
+  if (topologyCancelled) {
+    return { success: 0, failed: 0 };
+  }
+  const payload = await api("/api/v1/ebpf/entries/by-pods/batch", {
+    method: "POST",
+    body: JSON.stringify({
+      entries: edges.map((edge) => ({
+        pod1: edge.a.pod.podName,
+        pod2: edge.b.pod.podName,
+        ...edge.params,
+      })),
+    }),
+  });
+  const data = payload.data || {};
+  const failed = Number(data.skipped || 0) + Number(data.missing || 0) + Number(data.incomplete || 0);
+  return {
+    success: Math.max(0, edges.length - failed),
+    failed,
+    publishedCommands: Number(data.published || 0),
+  };
+}
+
 async function clearTopologyRules() {
   el.clearTopologyRules.disabled = true;
   setPill(el.topologyStatus, "清空中", "muted");
@@ -875,30 +867,6 @@ async function clearTopologyRules() {
   } finally {
     el.clearTopologyRules.disabled = false;
   }
-}
-
-async function runTopologyJobs(items, concurrency, worker, progressLabel = "下发") {
-  let cursor = 0;
-  let success = 0;
-  let failed = 0;
-  async function next() {
-    while (cursor < items.length && !topologyCancelled) {
-      const index = cursor++;
-      try {
-        const applied = await worker(items[index]);
-        if (applied) {
-          success++;
-        }
-      } catch {
-        failed++;
-      }
-      if ((success + failed) % 20 === 0 || success + failed === items.length) {
-        el.topologySummary.textContent = `${progressLabel} ${success + failed}/${items.length} 条，成功 ${success}，失败 ${failed}`;
-      }
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, next));
-  return { success, failed };
 }
 
 function drawTopology() {

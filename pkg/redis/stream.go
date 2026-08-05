@@ -54,6 +54,36 @@ func (c *Client) PublishCommand(ctx context.Context, command *ControlCommand) er
 	return err
 }
 
+func (c *Client) PublishCommands(ctx context.Context, commands []*ControlCommand) error {
+	if len(commands) == 0 {
+		return nil
+	}
+
+	pipe := c.client.Pipeline()
+	for _, command := range commands {
+		if command == nil || command.TargetNode == "" {
+			continue
+		}
+		values := map[string]interface{}{
+			"commandId":   command.CommandID,
+			"commandType": command.CommandType,
+			"payload":     command.Payload,
+			"timestamp":   command.Timestamp.UnixNano(),
+			"ttl":         command.TTL.Milliseconds(),
+		}
+		streamKey := fmt.Sprintf("control:node:%s", command.TargetNode)
+		pipe.XAdd(ctx, &redis.XAddArgs{
+			Stream: streamKey,
+			MaxLen: CommandStreamMaxLen,
+			Approx: true,
+			Values: values,
+		})
+	}
+
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
 type ControlBusConsumer struct {
 	client        *redis.Client
 	consumerID    string

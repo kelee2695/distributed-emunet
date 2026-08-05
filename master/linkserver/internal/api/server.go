@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -41,6 +42,10 @@ type EBPFEntryByPodsRequest struct {
 	Delay           uint32 `json:"delay"`
 	LossRate        uint32 `json:"lossRate"`
 	Jitter          uint32 `json:"jitter"`
+}
+
+type EBPFEntryBatchByPodsRequest struct {
+	Entries []EBPFEntryByPodsRequest `json:"entries"`
 }
 
 type EBPFEntryDeleteByPodsRequest struct {
@@ -183,6 +188,7 @@ func (s *MasterServer) setupRoutes() {
 	v1.HandleFunc("/ping/by-pods", s.handlePingByPods).Methods("POST")
 
 	v1.HandleFunc("/ebpf/entry/by-pods", s.handleRuleCreate).Methods("POST")
+	v1.HandleFunc("/ebpf/entries/by-pods/batch", s.handleRulesBatchCreate).Methods("POST")
 	v1.HandleFunc("/ebpf/entry/by-pods", s.handleRuleDelete).Methods("DELETE")
 	v1.HandleFunc("/ebpf/entries/clear", s.handleRulesClear).Methods("POST", "DELETE")
 
@@ -233,6 +239,105 @@ func (s *MasterServer) handleRuleCreate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	commands, err := makeRulePostCommands(req, pod1Info, pod2Info, time.Now())
+	if err != nil {
+		s.sendError(w, http.StatusInternalServerError, "Failed to build command: "+err.Error())
+		return
+	}
+	if err := s.redis.PublishCommand(r.Context(), commands[0]); err != nil {
+		s.sendError(w, http.StatusInternalServerError, "Failed to publish command: "+err.Error())
+		return
+	}
+
+	if err := s.redis.PublishCommand(r.Context(), commands[1]); err != nil {
+		s.logger.Warn("Failed to publish second command", zap.Error(err))
+	}
+
+	s.sendSuccess(w, map[string]string{"status": "published", "tx_id": fmt.Sprintf("%d", time.Now().UnixNano())})
+}
+
+func (s *MasterServer) handleRulesBatchCreate(w http.ResponseWriter, r *http.Request) {
+	var req EBPFEntryBatchByPodsRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		s.sendError(w, http.StatusBadRequest, "Invalid JSON: "+err.Error())
+		return
+	}
+	if len(req.Entries) == 0 {
+		s.sendError(w, http.StatusBadRequest, "entries are required")
+		return
+	}
+	if len(req.Entries) > 10000 {
+		s.sendError(w, http.StatusBadRequest, "too many entries; max 10000")
+		return
+	}
+
+	podNames := make([]string, 0, len(req.Entries)*2)
+	seenPods := make(map[string]struct{}, len(req.Entries)*2)
+	for _, entry := range req.Entries {
+		for _, podName := range []string{entry.Pod1, entry.Pod2} {
+			if podName == "" {
+				continue
+			}
+			if _, exists := seenPods[podName]; exists {
+				continue
+			}
+			seenPods[podName] = struct{}{}
+			podNames = append(podNames, podName)
+		}
+	}
+
+	podInfo, err := s.redis.GetPodInfoDirectlyBatch(r.Context(), podNames)
+	if err != nil {
+		s.sendError(w, http.StatusInternalServerError, "Failed to load pod info: "+err.Error())
+		return
+	}
+
+	now := time.Now()
+	commands := make([]*redis.ControlCommand, 0, len(req.Entries)*2)
+	skipped := 0
+	missing := 0
+	incomplete := 0
+	for _, entry := range req.Entries {
+		if entry.Pod1 == "" || entry.Pod2 == "" || entry.Pod1 == entry.Pod2 {
+			skipped++
+			continue
+		}
+		pod1Info := podInfo[entry.Pod1]
+		pod2Info := podInfo[entry.Pod2]
+		if pod1Info == nil || pod2Info == nil {
+			missing++
+			continue
+		}
+		if pod1Info.NodeName == "" || pod2Info.NodeName == "" || pod1Info.MACAddress == "" || pod2Info.MACAddress == "" {
+			incomplete++
+			continue
+		}
+		nextCommands, err := makeRulePostCommands(entry, pod1Info, pod2Info, now)
+		if err != nil {
+			skipped++
+			continue
+		}
+		commands = append(commands, nextCommands...)
+	}
+
+	if err := s.redis.PublishCommands(r.Context(), commands); err != nil {
+		s.sendError(w, http.StatusInternalServerError, "Failed to publish commands: "+err.Error())
+		return
+	}
+
+	s.sendSuccess(w, map[string]interface{}{
+		"status":     "published",
+		"entries":    len(req.Entries),
+		"published":  len(commands),
+		"skipped":    skipped,
+		"missing":    missing,
+		"incomplete": incomplete,
+	})
+}
+
+func makeRulePostCommands(req EBPFEntryByPodsRequest, pod1Info, pod2Info *redis.PodStatus, now time.Time) ([]*redis.ControlCommand, error) {
 	payload1 := &redis.EBPFCommandPayload{
 		Ifindex:         uint32(pod2Info.VethIfIndex),
 		SrcMac:          pod1Info.MACAddress,
@@ -241,7 +346,6 @@ func (s *MasterServer) handleRuleCreate(w http.ResponseWriter, r *http.Request) 
 		LossRate:        req.LossRate,
 		Jitter:          req.Jitter,
 	}
-
 	payload2 := &redis.EBPFCommandPayload{
 		Ifindex:         uint32(pod1Info.VethIfIndex),
 		SrcMac:          pod2Info.MACAddress,
@@ -251,16 +355,41 @@ func (s *MasterServer) handleRuleCreate(w http.ResponseWriter, r *http.Request) 
 		Jitter:          req.Jitter,
 	}
 
-	if err := s.redis.PublishEBPFCommand(r.Context(), pod2Info.NodeName, "POST", payload1); err != nil {
-		s.sendError(w, http.StatusInternalServerError, "Failed to publish command: "+err.Error())
-		return
+	payloadData1, err := json.Marshal(payload1)
+	if err != nil {
+		return nil, err
+	}
+	payloadData2, err := json.Marshal(payload2)
+	if err != nil {
+		return nil, err
 	}
 
-	if err := s.redis.PublishEBPFCommand(r.Context(), pod1Info.NodeName, "POST", payload2); err != nil {
-		s.logger.Warn("Failed to publish second command", zap.Error(err))
-	}
+	idBase := fmt.Sprintf("POST-%d-%s-%s", now.UnixNano(), sanitizeCommandIDPart(req.Pod1), sanitizeCommandIDPart(req.Pod2))
+	return []*redis.ControlCommand{
+		{
+			CommandID:   idBase + "-a",
+			CommandType: "POST",
+			TargetNode:  pod2Info.NodeName,
+			Payload:     string(payloadData1),
+			Timestamp:   now,
+			TTL:         redis.CommandTTL,
+		},
+		{
+			CommandID:   idBase + "-b",
+			CommandType: "POST",
+			TargetNode:  pod1Info.NodeName,
+			Payload:     string(payloadData2),
+			Timestamp:   now,
+			TTL:         redis.CommandTTL,
+		},
+	}, nil
+}
 
-	s.sendSuccess(w, map[string]string{"status": "published", "tx_id": fmt.Sprintf("%d", time.Now().UnixNano())})
+func sanitizeCommandIDPart(value string) string {
+	value = strings.ReplaceAll(value, "/", "_")
+	value = strings.ReplaceAll(value, ":", "_")
+	value = strings.ReplaceAll(value, " ", "_")
+	return value
 }
 
 func (s *MasterServer) handleRuleDelete(w http.ResponseWriter, r *http.Request) {
