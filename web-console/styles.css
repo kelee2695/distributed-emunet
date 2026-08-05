@@ -183,6 +183,10 @@ select:focus {
   margin-bottom: 16px;
 }
 
+.panel-head.compact {
+  margin-bottom: 10px;
+}
+
 h3 {
   margin: 0 0 10px;
   font-size: 13px;
@@ -266,6 +270,35 @@ tr:last-child td {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+}
+
+.ping-box {
+  border-top: 1px solid var(--line);
+  margin-top: 16px;
+  padding-top: 16px;
+}
+
+.ping-form {
+  display: grid;
+  grid-template-columns: 110px 130px auto;
+  align-items: end;
+  gap: 10px;
+}
+
+.ping-output {
+  min-height: 132px;
+  max-height: 260px;
+  margin: 12px 0 0;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #1f2528;
+  color: #eaf0ea;
+  padding: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
 }
 
 .image-groups {
@@ -417,6 +450,10 @@ tr:last-child td {
   }
 
   .rule-form {
+    grid-template-columns: 1fr;
+  }
+
+  .ping-form {
     grid-template-columns: 1fr;
   }
 

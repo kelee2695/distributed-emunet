@@ -99,6 +99,27 @@
             <button id="apply-rule" class="primary">应用规则</button>
             <button id="delete-rule" class="danger">删除规则</button>
           </div>
+          <div class="ping-box">
+            <div class="panel-head compact">
+              <div>
+                <h3>Ping 测试</h3>
+                <p>从 Pod 1 ping Pod 2，观察 RTT 与丢包</p>
+              </div>
+              <span id="ping-status" class="pill muted">就绪</span>
+            </div>
+            <div class="ping-form">
+              <label>
+                <span>次数</span>
+                <input id="ping-count" type="number" min="1" max="10" step="1" value="4" />
+              </label>
+              <label>
+                <span>单包超时 s</span>
+                <input id="ping-timeout" type="number" min="1" max="10" step="1" value="2" />
+              </label>
+              <button id="run-ping" class="primary">开始 Ping</button>
+            </div>
+            <pre id="ping-output" class="ping-output">暂无测试结果</pre>
+          </div>
         </div>
 
         <div class="panel monitor-panel">

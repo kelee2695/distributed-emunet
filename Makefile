@@ -197,7 +197,7 @@ docker-build-controller:
 
 docker-build-linkserver:
 	@echo "Building linkserver Docker image..."
-	docker build -t $(REGISTRY)/emunet-linkserver:$(VERSION) -f $(DEPLOY_LINKSERVER)/Dockerfile .
+	docker build -t $(REGISTRY)/linkserver:$(VERSION) -f $(DEPLOY_LINKSERVER)/Dockerfile .
 
 docker-build-node-agent:
 	@echo "Building node-agent Docker image..."
@@ -214,7 +214,7 @@ docker-push-controller:
 	docker push $(REGISTRY)/emunet-controller:$(VERSION)
 
 docker-push-linkserver:
-	docker push $(REGISTRY)/emunet-linkserver:$(VERSION)
+	docker push $(REGISTRY)/linkserver:$(VERSION)
 
 docker-push-node-agent:
 	docker push $(REGISTRY)/emunet-node-agent:$(VERSION)

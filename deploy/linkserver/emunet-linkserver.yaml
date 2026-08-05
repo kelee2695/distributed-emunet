@@ -31,6 +31,12 @@ rules:
       - get
       - list
       - watch
+  - apiGroups:
+      - ""
+    resources:
+      - pods/exec
+    verbs:
+      - create
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -87,7 +93,7 @@ spec:
       containers:
         - name: linkserver
           image: 100.75.179.29:5000/linkserver:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           command: ["/linkserver"]
           args:
             # 绑定 0.0.0.0 才能被外部访问

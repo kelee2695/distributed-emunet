@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,9 +10,14 @@ import (
 
 	"github.com/gorilla/mux"
 	"go.uber.org/zap"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
+	k8sscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/remotecommand"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	emunetv1 "github.com/emunet/emunet-operator/master/controller/api/v1"
@@ -39,6 +45,24 @@ type EBPFEntryByPodsRequest struct {
 type EBPFEntryDeleteByPodsRequest struct {
 	Pod1 string `json:"pod1"`
 	Pod2 string `json:"pod2"`
+}
+
+type PingByPodsRequest struct {
+	Namespace      string `json:"namespace,omitempty"`
+	Pod1           string `json:"pod1"`
+	Pod2           string `json:"pod2"`
+	Count          int    `json:"count,omitempty"`
+	TimeoutSeconds int    `json:"timeoutSeconds,omitempty"`
+}
+
+type PingResult struct {
+	SourcePod      string `json:"sourcePod"`
+	TargetPod      string `json:"targetPod"`
+	TargetIP       string `json:"targetIP"`
+	Count          int    `json:"count"`
+	TimeoutSeconds int    `json:"timeoutSeconds"`
+	Stdout         string `json:"stdout"`
+	Stderr         string `json:"stderr,omitempty"`
 }
 
 type EmuNetApplyRequest struct {
@@ -77,6 +101,8 @@ type Response struct {
 type MasterServer struct {
 	redis     *redis.Client
 	k8sClient client.Client
+	clientset kubernetes.Interface
+	restCfg   *rest.Config
 	router    *mux.Router
 	logger    *zap.Logger
 	webDir    string
@@ -86,12 +112,14 @@ type MasterServer struct {
 }
 
 // NewMasterServer 初始化
-func NewMasterServer(redisClient *redis.Client, k8sClient client.Client, logger *zap.Logger, webDir string) *MasterServer {
+func NewMasterServer(redisClient *redis.Client, k8sClient client.Client, clientset kubernetes.Interface, restCfg *rest.Config, logger *zap.Logger, webDir string) *MasterServer {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &MasterServer{
 		redis:     redisClient,
 		k8sClient: k8sClient,
+		clientset: clientset,
+		restCfg:   restCfg,
 		logger:    logger,
 		router:    mux.NewRouter(),
 		webDir:    webDir,
@@ -119,6 +147,8 @@ func (s *MasterServer) setupRoutes() {
 	v1 := s.router.PathPrefix("/api/v1").Subrouter()
 
 	v1.HandleFunc("/health", s.healthCheck).Methods("GET")
+
+	v1.HandleFunc("/ping/by-pods", s.handlePingByPods).Methods("POST")
 
 	v1.HandleFunc("/ebpf/entry/by-pods", s.handleRuleCreate).Methods("POST")
 	v1.HandleFunc("/ebpf/entry/by-pods", s.handleRuleDelete).Methods("DELETE")
@@ -233,6 +263,114 @@ func (s *MasterServer) handleRuleDelete(w http.ResponseWriter, r *http.Request) 
 	}
 
 	s.sendSuccess(w, map[string]string{"status": "published"})
+}
+
+func (s *MasterServer) handlePingByPods(w http.ResponseWriter, r *http.Request) {
+	var req PingByPodsRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		s.sendError(w, http.StatusBadRequest, "Invalid JSON: "+err.Error())
+		return
+	}
+	if req.Namespace == "" {
+		req.Namespace = "default"
+	}
+	if req.Pod1 == "" || req.Pod2 == "" {
+		s.sendError(w, http.StatusBadRequest, "pod1 and pod2 are required")
+		return
+	}
+	if req.Pod1 == req.Pod2 {
+		s.sendError(w, http.StatusBadRequest, "pod1 and pod2 must be different")
+		return
+	}
+	if req.Count <= 0 {
+		req.Count = 4
+	}
+	if req.Count > 10 {
+		req.Count = 10
+	}
+	if req.TimeoutSeconds <= 0 {
+		req.TimeoutSeconds = 2
+	}
+	if req.TimeoutSeconds > 10 {
+		req.TimeoutSeconds = 10
+	}
+
+	targetInfo, err := s.redis.GetPodInfoDirectly(r.Context(), req.Pod2)
+	if err != nil || targetInfo == nil || targetInfo.PodIP == "" {
+		s.sendError(w, http.StatusNotFound, "target Pod IP not found in cache")
+		return
+	}
+
+	sourcePod := &corev1.Pod{}
+	if err := s.k8sClient.Get(r.Context(), types.NamespacedName{Namespace: req.Namespace, Name: req.Pod1}, sourcePod); err != nil {
+		if apierrors.IsNotFound(err) {
+			s.sendError(w, http.StatusNotFound, "source Pod not found")
+			return
+		}
+		s.logger.Error("failed to get source pod", zap.Error(err))
+		s.sendError(w, http.StatusInternalServerError, "Failed to get source Pod")
+		return
+	}
+	if sourcePod.Status.Phase != corev1.PodRunning {
+		s.sendError(w, http.StatusPreconditionFailed, "source Pod is not running")
+		return
+	}
+	if len(sourcePod.Spec.Containers) == 0 {
+		s.sendError(w, http.StatusPreconditionFailed, "source Pod has no containers")
+		return
+	}
+
+	stdout, stderr, err := s.execPing(r.Context(), sourcePod, targetInfo.PodIP, req.Count, req.TimeoutSeconds)
+	result := PingResult{
+		SourcePod:      req.Pod1,
+		TargetPod:      req.Pod2,
+		TargetIP:       targetInfo.PodIP,
+		Count:          req.Count,
+		TimeoutSeconds: req.TimeoutSeconds,
+		Stdout:         stdout,
+		Stderr:         stderr,
+	}
+	if err != nil {
+		s.logger.Warn("ping command failed", zap.Error(err), zap.String("stdout", stdout), zap.String("stderr", stderr))
+		s.sendError(w, http.StatusBadGateway, fmt.Sprintf("Ping failed: %v\n%s", err, stderr))
+		return
+	}
+	s.sendSuccess(w, result)
+}
+
+func (s *MasterServer) execPing(ctx context.Context, pod *corev1.Pod, targetIP string, count int, timeoutSeconds int) (string, string, error) {
+	command := []string{
+		"ping",
+		"-c", fmt.Sprintf("%d", count),
+		"-W", fmt.Sprintf("%d", timeoutSeconds),
+		targetIP,
+	}
+	req := s.clientset.CoreV1().RESTClient().
+		Post().
+		Resource("pods").
+		Name(pod.Name).
+		Namespace(pod.Namespace).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: pod.Spec.Containers[0].Name,
+			Command:   command,
+			Stdout:    true,
+			Stderr:    true,
+		}, k8sscheme.ParameterCodec)
+
+	executor, err := remotecommand.NewSPDYExecutor(s.restCfg, http.MethodPost, req.URL())
+	if err != nil {
+		return "", "", err
+	}
+
+	var stdout, stderr bytes.Buffer
+	err = executor.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+	return stdout.String(), stderr.String(), err
 }
 
 // =================================================================================

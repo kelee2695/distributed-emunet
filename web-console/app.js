@@ -38,6 +38,11 @@ const el = {
   applyRule: document.querySelector("#apply-rule"),
   deleteRule: document.querySelector("#delete-rule"),
   ruleStatus: document.querySelector("#rule-status"),
+  pingCount: document.querySelector("#ping-count"),
+  pingTimeout: document.querySelector("#ping-timeout"),
+  runPing: document.querySelector("#run-ping"),
+  pingStatus: document.querySelector("#ping-status"),
+  pingOutput: document.querySelector("#ping-output"),
 };
 
 let pods = [];
@@ -64,6 +69,7 @@ function init() {
   el.autoRefresh.addEventListener("change", configureAutoRefresh);
   el.applyRule.addEventListener("click", applyRule);
   el.deleteRule.addEventListener("click", deleteRule);
+  el.runPing.addEventListener("click", runPing);
 
   saveConfig();
   checkHealth();
@@ -384,6 +390,45 @@ async function applyRule() {
 
 async function deleteRule() {
   await submitRule("DELETE");
+}
+
+async function runPing() {
+  const pod1 = el.pod1.value;
+  const pod2 = el.pod2.value;
+  if (!pod1 || !pod2 || pod1 === pod2) {
+    setPill(el.pingStatus, "请选择两个不同 Pod", "warn");
+    return;
+  }
+
+  setPill(el.pingStatus, "测试中", "muted");
+  el.runPing.disabled = true;
+  el.pingOutput.textContent = "ping running...";
+  try {
+    const payload = await api("/api/v1/ping/by-pods", {
+      method: "POST",
+      body: JSON.stringify({
+        namespace: el.namespace.value.trim() || "default",
+        pod1,
+        pod2,
+        count: numberValue(el.pingCount) || 4,
+        timeoutSeconds: numberValue(el.pingTimeout) || 2,
+      }),
+    });
+    const data = payload.data || {};
+    setPill(el.pingStatus, "测试完成", "ok");
+    el.pingOutput.textContent = [
+      `$ ${data.sourcePod} -> ${data.targetPod} (${data.targetIP})`,
+      data.stdout || "",
+      data.stderr ? `stderr:\n${data.stderr}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  } catch (err) {
+    setPill(el.pingStatus, "测试失败", "bad");
+    el.pingOutput.textContent = err?.message || String(err);
+  } finally {
+    el.runPing.disabled = false;
+  }
 }
 
 async function submitRule(method) {

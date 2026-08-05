@@ -15,6 +15,7 @@ import (
 	"go.uber.org/zap/zapcore"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -73,13 +74,18 @@ func main() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(emunetv1.AddToScheme(scheme))
 
-	k8sClient, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+	restConfig := ctrl.GetConfigOrDie()
+	k8sClient, err := client.New(restConfig, client.Options{Scheme: scheme})
 	if err != nil {
 		sugar.Fatalw("failed to initialize Kubernetes client", "error", err)
 	}
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		sugar.Fatalw("failed to initialize Kubernetes clientset", "error", err)
+	}
 
 	// 4. 初始化业务逻辑
-	apiHandler := api.NewMasterServer(redisClient, k8sClient, logger, webDir)
+	apiHandler := api.NewMasterServer(redisClient, k8sClient, clientset, restConfig, logger, webDir)
 
 	// 5. 启动 HTTP Server
 	server := &http.Server{
