@@ -17,6 +17,7 @@
 - `POST /api/v1/ping/by-pods`
 
 拓扑规则面板在浏览器中分页读取 Pod 详情，按选定规则生成节点位置和链路参数，再通过 `POST /api/v1/ebpf/entry/by-pods` 分批下发。
+动态规则模式会按设定间隔在浏览器中更新节点坐标，重算链路参数，并跳过尚未完成的重叠刷新轮次。
 清空全部规则会通过 `POST /api/v1/ebpf/entries/clear` 向所有 node-agent 发布全局清空命令。
 
 重新构建并部署 LinkServer 后，打开 `http://<master-ip>:30082/` 即可使用。页面会自动把 LinkServer 地址设置为当前访问地址。

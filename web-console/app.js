@@ -54,9 +54,13 @@ const el = {
   topologyMaxLoss: document.querySelector("#topology-max-loss"),
   topologyJitterScale: document.querySelector("#topology-jitter-scale"),
   topologyBandwidth: document.querySelector("#topology-bandwidth"),
+  topologyDynamicInterval: document.querySelector("#topology-dynamic-interval"),
+  topologyMotionScale: document.querySelector("#topology-motion-scale"),
   loadTopologyPods: document.querySelector("#load-topology-pods"),
   previewTopology: document.querySelector("#preview-topology"),
   applyTopology: document.querySelector("#apply-topology"),
+  startDynamicTopology: document.querySelector("#start-dynamic-topology"),
+  stopDynamicTopology: document.querySelector("#stop-dynamic-topology"),
   clearTopologyRules: document.querySelector("#clear-topology-rules"),
   cancelTopology: document.querySelector("#cancel-topology"),
   topologyCanvas: document.querySelector("#topology-canvas"),
@@ -79,6 +83,11 @@ let topologyPods = [];
 let topologyNodes = [];
 let topologyEdges = [];
 let topologyCancelled = false;
+let dynamicTopologyTimer = null;
+let dynamicTopologyRunning = false;
+let dynamicTopologyInFlight = false;
+let dynamicTopologyTick = 0;
+let dynamicTopologySkipped = 0;
 
 function init() {
   const sameOriginUrl = window.location.protocol.startsWith("http") ? window.location.origin : el.linkserverUrl.value;
@@ -110,9 +119,15 @@ function init() {
   el.loadTopologyPods.addEventListener("click", loadTopologyPods);
   el.previewTopology.addEventListener("click", previewTopology);
   el.applyTopology.addEventListener("click", applyTopology);
+  el.startDynamicTopology.addEventListener("click", startDynamicTopology);
+  el.stopDynamicTopology.addEventListener("click", () => {
+    stopDynamicTopology();
+    setPill(el.topologyStatus, "动态已停止", "warn");
+  });
   el.clearTopologyRules.addEventListener("click", clearTopologyRules);
   el.cancelTopology.addEventListener("click", () => {
     topologyCancelled = true;
+    stopDynamicTopology();
     setPill(el.topologyStatus, "停止中", "warn");
   });
   window.addEventListener("resize", () => {
@@ -510,6 +525,7 @@ function renderPodSelects() {
 }
 
 function clearTopology(message) {
+  stopDynamicTopology();
   topologyPods = [];
   topologyNodes = [];
   topologyEdges = [];
@@ -594,6 +610,8 @@ function layoutTopologyNodes(podList, rule) {
       const angle = (2 * Math.PI * index) / n - Math.PI / 2;
       return {
         pod,
+        baseX: 0.5 + 0.42 * Math.cos(angle),
+        baseY: 0.5 + 0.42 * Math.sin(angle),
         x: 0.5 + 0.42 * Math.cos(angle),
         y: 0.5 + 0.42 * Math.sin(angle),
       };
@@ -605,6 +623,8 @@ function layoutTopologyNodes(podList, rule) {
       const h2 = hashText(`${pod.podName}:y`);
       return {
         pod,
+        baseX: 0.08 + (h1 / 0xffffffff) * 0.84,
+        baseY: 0.08 + (h2 / 0xffffffff) * 0.84,
         x: 0.08 + (h1 / 0xffffffff) * 0.84,
         y: 0.08 + (h2 / 0xffffffff) * 0.84,
       };
@@ -619,6 +639,8 @@ function layoutTopologyNodes(podList, rule) {
       pod,
       gridCol: col,
       gridRow: row,
+      baseX: cols <= 1 ? 0.5 : 0.06 + (col / (cols - 1)) * 0.88,
+      baseY: rows <= 1 ? 0.5 : 0.08 + (row / (rows - 1)) * 0.84,
       x: cols <= 1 ? 0.5 : 0.06 + (col / (cols - 1)) * 0.88,
       y: rows <= 1 ? 0.5 : 0.08 + (row / (rows - 1)) * 0.84,
     };
@@ -729,6 +751,116 @@ async function applyTopology() {
   }
 }
 
+async function startDynamicTopology() {
+  if (dynamicTopologyRunning) {
+    setPill(el.topologyStatus, "动态运行中", "ok");
+    return;
+  }
+  if (!topologyNodes.length || !topologyEdges.length) {
+    const ready = await previewTopology();
+    if (!ready) {
+      return;
+    }
+  }
+  if (topologyEdges.length > 5000) {
+    setPill(el.topologyStatus, "链路过多", "bad");
+    el.topologySummary.textContent = "动态模式一次最多刷新 5000 条链路，请降低节点上限或 k 值";
+    return;
+  }
+
+  dynamicTopologyRunning = true;
+  dynamicTopologyTick = 0;
+  dynamicTopologySkipped = 0;
+  topologyCancelled = false;
+  el.startDynamicTopology.disabled = true;
+  setPill(el.topologyStatus, "动态运行中", "ok");
+
+  await runDynamicTopologyTick();
+  if (!dynamicTopologyRunning) {
+    return;
+  }
+  const intervalMs = Math.max(500, numberValue(el.topologyDynamicInterval) || 1000);
+  dynamicTopologyTimer = window.setInterval(runDynamicTopologyTick, intervalMs);
+}
+
+function stopDynamicTopology() {
+  topologyCancelled = true;
+  if (dynamicTopologyTimer) {
+    window.clearInterval(dynamicTopologyTimer);
+    dynamicTopologyTimer = null;
+  }
+  dynamicTopologyRunning = false;
+  dynamicTopologyInFlight = false;
+  if (el.startDynamicTopology) {
+    el.startDynamicTopology.disabled = false;
+  }
+}
+
+async function runDynamicTopologyTick() {
+  if (!dynamicTopologyRunning) {
+    return;
+  }
+  if (dynamicTopologyInFlight) {
+    dynamicTopologySkipped++;
+    el.topologySummary.textContent = `上一轮动态下发未完成，已跳过 ${dynamicTopologySkipped} 次`;
+    return;
+  }
+
+  dynamicTopologyInFlight = true;
+  dynamicTopologyTick++;
+  try {
+    updateDynamicNodePositions(dynamicTopologyTick);
+    topologyEdges = buildTopologyEdges(topologyNodes, el.topologyRule.value);
+    if (topologyEdges.length > 5000) {
+      throw new Error("动态链路超过 5000 条，请降低节点上限或 k 值");
+    }
+    drawTopology();
+    const result = await runTopologyJobs(
+      topologyEdges,
+      4,
+      async (edge) => {
+        if (!dynamicTopologyRunning || topologyCancelled) {
+          return false;
+        }
+        await api("/api/v1/ebpf/entry/by-pods", {
+          method: "POST",
+          body: JSON.stringify({
+            pod1: edge.a.pod.podName,
+            pod2: edge.b.pod.podName,
+            ...edge.params,
+          }),
+        });
+        return true;
+      },
+      "动态",
+    );
+    const sample = topologyNodes[0];
+    setPill(el.topologyStatus, dynamicTopologyRunning ? "动态运行中" : "已停止", dynamicTopologyRunning ? "ok" : "warn");
+    el.topologySummary.textContent = `第 ${dynamicTopologyTick} 轮：${topologyNodes.length} 节点，${topologyEdges.length} 链路，成功 ${result.success}，失败 ${result.failed}；样例坐标 ${sample.pod.podName}=(${sample.x.toFixed(3)}, ${sample.y.toFixed(3)})`;
+  } catch (err) {
+    stopDynamicTopology();
+    setPill(el.topologyStatus, shortError(err), "bad");
+    el.topologySummary.textContent = err?.message || String(err);
+  } finally {
+    dynamicTopologyInFlight = false;
+  }
+}
+
+function updateDynamicNodePositions(tick) {
+  const scale = Math.min(0.3, numberValue(el.topologyMotionScale) / 100);
+  const t = tick * 0.45;
+  for (const node of topologyNodes) {
+    const hx = hashText(`${node.pod.podName}:motion-x`);
+    const hy = hashText(`${node.pod.podName}:motion-y`);
+    const phaseX = (hx / 0xffffffff) * Math.PI * 2;
+    const phaseY = (hy / 0xffffffff) * Math.PI * 2;
+    const ampX = scale * (0.45 + ((hx >>> 8) % 55) / 100);
+    const ampY = scale * (0.45 + ((hy >>> 8) % 55) / 100);
+    node.x = clamp01((node.baseX ?? node.x) + ampX * Math.sin(t + phaseX), 0.03, 0.97);
+    node.y = clamp01((node.baseY ?? node.y) + ampY * Math.cos(t * 0.83 + phaseY), 0.03, 0.97);
+  }
+}
+
 async function clearTopologyRules() {
   el.clearTopologyRules.disabled = true;
   setPill(el.topologyStatus, "清空中", "muted");
@@ -745,7 +877,7 @@ async function clearTopologyRules() {
   }
 }
 
-async function runTopologyJobs(items, concurrency, worker) {
+async function runTopologyJobs(items, concurrency, worker, progressLabel = "下发") {
   let cursor = 0;
   let success = 0;
   let failed = 0;
@@ -761,7 +893,7 @@ async function runTopologyJobs(items, concurrency, worker) {
         failed++;
       }
       if ((success + failed) % 20 === 0 || success + failed === items.length) {
-        el.topologySummary.textContent = `下发 ${success + failed}/${items.length} 条，成功 ${success}，失败 ${failed}`;
+        el.topologySummary.textContent = `${progressLabel} ${success + failed}/${items.length} 条，成功 ${success}，失败 ${failed}`;
       }
     }
   }
@@ -817,6 +949,10 @@ function hashText(text) {
     hash = Math.imul(hash, 16777619);
   }
   return hash >>> 0;
+}
+
+function clamp01(value, min, max) {
+  return Math.max(min, Math.min(max, value));
 }
 
 function renderEmuNetList() {

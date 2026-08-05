@@ -231,11 +231,21 @@
               <span>带宽 bps</span>
               <input id="topology-bandwidth" type="number" min="0" step="1" value="0" />
             </label>
+            <label>
+              <span>动态间隔 ms</span>
+              <input id="topology-dynamic-interval" type="number" min="500" step="100" value="1000" />
+            </label>
+            <label>
+              <span>移动幅度 %</span>
+              <input id="topology-motion-scale" type="number" min="0" max="30" step="1" value="6" />
+            </label>
           </div>
           <div class="actions">
             <button id="load-topology-pods">加载节点</button>
             <button id="preview-topology">生成预览</button>
             <button id="apply-topology" class="primary">下发拓扑规则</button>
+            <button id="start-dynamic-topology" class="primary">启动动态规则</button>
+            <button id="stop-dynamic-topology">停止动态规则</button>
             <button id="clear-topology-rules">清空全部规则</button>
             <button id="cancel-topology" class="danger">停止下发</button>
           </div>
