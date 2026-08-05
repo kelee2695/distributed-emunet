@@ -52,6 +52,8 @@ let pods = [];
 let emunets = [];
 let refreshTimer = null;
 let detailLoaded = false;
+let stopProgressToken = 0;
+let stopProgressActive = false;
 let podPage = {
   offset: 0,
   limit: 100,
@@ -201,36 +203,69 @@ async function stopEmuNet() {
   el.emunetStatus.textContent = "正在关闭";
   try {
     const payload = await api(`/api/v1/emunets/${ns}/${name}/stop`, { method: "POST" });
-    const deletingPods = payload.data?.deletingPods;
-    el.emunetStatus.textContent =
-      Number.isFinite(deletingPods) && deletingPods > 0 ? `关闭请求已提交，正在删除 ${deletingPods} 个 Pod` : "关闭请求已提交";
-    clearPodDetails("实例关闭中");
+    const deletingPods = Number(payload.data?.deletingPods || 0);
+    startStopProgress(ns, name, deletingPods);
     await refreshEmuNets();
-    await refreshSummary();
-    monitorStopProgress(ns, name);
   } catch (err) {
+    stopProgressActive = false;
     el.emunetStatus.textContent = shortError(err);
   } finally {
     el.stopEmuNet.disabled = false;
   }
 }
 
-async function monitorStopProgress(ns, name) {
-  for (let attempt = 0; attempt < 20; attempt++) {
-    await sleep(3000);
+function startStopProgress(ns, name, initialPods) {
+  const token = ++stopProgressToken;
+  stopProgressActive = true;
+  const totalPods = Math.max(0, Number(initialPods || 0));
+  renderStopProgress(totalPods, totalPods);
+  monitorStopProgress(ns, name, totalPods, token);
+}
+
+async function monitorStopProgress(ns, name, totalPods, token) {
+  for (let attempt = 0; attempt < 120; attempt++) {
+    if (token !== stopProgressToken) {
+      return;
+    }
     try {
       const payload = await api(`/api/v1/emunets/${ns}/${name}/delete-status`);
       const remainingPods = Number(payload.data?.remainingPods || 0);
       if (remainingPods <= 0) {
+        renderStopProgress(0, totalPods);
         el.emunetStatus.textContent = "实例已关闭";
+        stopProgressActive = false;
         await refreshEmuNets();
         return;
       }
-      el.emunetStatus.textContent = `实例关闭中，还剩 ${remainingPods} 个 Pod`;
+      renderStopProgress(remainingPods, Math.max(totalPods, remainingPods));
     } catch {
+      if (token === stopProgressToken) {
+        stopProgressActive = false;
+        el.emunetStatus.textContent = "删除请求已提交，暂时无法读取进度";
+      }
       return;
     }
+    await sleep(1000);
   }
+  if (token === stopProgressToken) {
+    stopProgressActive = false;
+    el.emunetStatus.textContent = "删除仍在进行，请稍后刷新实例";
+  }
+}
+
+function renderStopProgress(remainingPods, totalPods) {
+  const deletedPods = Math.max(0, totalPods - remainingPods);
+  const text =
+    totalPods > 0
+      ? `实例关闭中：已删除 ${deletedPods}/${totalPods} 个 Pod，剩余 ${remainingPods}`
+      : "实例关闭中：等待 Kubernetes 清理 Pod";
+  el.emunetStatus.textContent = remainingPods <= 0 && totalPods > 0 ? `实例已关闭：已删除 ${totalPods}/${totalPods} 个 Pod` : text;
+  el.podSummary.textContent = text;
+  el.metricDesired.textContent = String(totalPods);
+  el.metricReady.textContent = String(remainingPods);
+  el.metricMac.textContent = "-";
+  el.metricNodes.textContent = "-";
+  el.podTable.innerHTML = `<tr><td colspan="6" class="empty">${escapeHtml(text)}</td></tr>`;
 }
 
 async function refreshPods(options = {}) {
@@ -271,6 +306,9 @@ async function refreshPods(options = {}) {
 }
 
 async function refreshSummary() {
+  if (stopProgressActive) {
+    return;
+  }
   saveConfig();
   const ns = encodeURIComponent(el.namespace.value.trim() || "default");
   const name = encodeURIComponent(el.emunetName.value.trim());
@@ -462,6 +500,9 @@ function selectEmuNet(namespace, name) {
 }
 
 function updateSelectedStatus() {
+  if (stopProgressActive) {
+    return;
+  }
   const selected = findSelectedEmuNet();
   if (!selected) {
     el.emunetStatus.textContent = "当前实例未创建";
