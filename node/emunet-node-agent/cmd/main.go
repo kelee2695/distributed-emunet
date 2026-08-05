@@ -146,6 +146,9 @@ func handleControlCommand(server *api.AgentServer) redis.CommandHandler {
 			return pkg.AddEBPFEntry(ebpfMap, payload.Ifindex, payload.SrcMac, payload.ThrottleRateBps, payload.Delay, payload.LossRate, payload.Jitter)
 		case "DELETE":
 			return pkg.DeleteEBPFEntry(ebpfMap, payload.Ifindex, payload.SrcMac)
+		case "CLEAR":
+			_, err := pkg.ClearEBPFEntries(ebpfMap)
+			return err
 		default:
 			return fmt.Errorf("unknown command type: %s", command.CommandType)
 		}

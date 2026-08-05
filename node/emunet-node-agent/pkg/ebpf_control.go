@@ -77,6 +77,28 @@ func DeleteEBPFEntry(ebpfMap *ebpf.Map, ifindex uint32, macStr string) error {
 	return ebpfMap.Delete(key)
 }
 
+func ClearEBPFEntries(ebpfMap *ebpf.Map) (int, error) {
+	var keys []FlowKey
+	var key FlowKey
+	var value HandleEmu
+	iter := ebpfMap.Iterate()
+	for iter.Next(&key, &value) {
+		keys = append(keys, key)
+	}
+	if err := iter.Err(); err != nil {
+		return 0, err
+	}
+
+	deleted := 0
+	for _, key := range keys {
+		if err := ebpfMap.Delete(key); err != nil {
+			return deleted, err
+		}
+		deleted++
+	}
+	return deleted, nil
+}
+
 func LoadEBPFMap(mapPath string) (*ebpf.Map, error) {
 	return ebpf.LoadPinnedMap(mapPath, &ebpf.LoadPinOptions{})
 }

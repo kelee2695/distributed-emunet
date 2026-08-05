@@ -184,6 +184,7 @@ func (s *MasterServer) setupRoutes() {
 
 	v1.HandleFunc("/ebpf/entry/by-pods", s.handleRuleCreate).Methods("POST")
 	v1.HandleFunc("/ebpf/entry/by-pods", s.handleRuleDelete).Methods("DELETE")
+	v1.HandleFunc("/ebpf/entries/clear", s.handleRulesClear).Methods("POST", "DELETE")
 
 	v1.HandleFunc("/emunets", s.listEmuNets).Methods("GET")
 	v1.HandleFunc("/emunets", s.applyEmuNet).Methods("POST")
@@ -297,6 +298,40 @@ func (s *MasterServer) handleRuleDelete(w http.ResponseWriter, r *http.Request) 
 	}
 
 	s.sendSuccess(w, map[string]string{"status": "published"})
+}
+
+func (s *MasterServer) handleRulesClear(w http.ResponseWriter, r *http.Request) {
+	nodes, err := s.clientset.CoreV1().Nodes().List(r.Context(), metav1.ListOptions{})
+	if err != nil {
+		s.sendError(w, http.StatusInternalServerError, "Failed to list nodes: "+err.Error())
+		return
+	}
+
+	published := 0
+	failures := make(map[string]string)
+	for _, node := range nodes.Items {
+		if err := s.redis.PublishEBPFCommand(r.Context(), node.Name, "CLEAR", &redis.EBPFCommandPayload{}); err != nil {
+			failures[node.Name] = err.Error()
+			continue
+		}
+		published++
+	}
+
+	if len(failures) > 0 {
+		s.sendSuccess(w, map[string]interface{}{
+			"status":     "partial",
+			"published":  published,
+			"totalNodes": len(nodes.Items),
+			"failures":   failures,
+		})
+		return
+	}
+
+	s.sendSuccess(w, map[string]interface{}{
+		"status":     "published",
+		"published":  published,
+		"totalNodes": len(nodes.Items),
+	})
 }
 
 func (s *MasterServer) handlePingByPods(w http.ResponseWriter, r *http.Request) {

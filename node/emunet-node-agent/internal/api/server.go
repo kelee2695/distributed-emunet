@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -99,6 +100,7 @@ func NewServer(redisClient *redis.Client, maxConcurrent int, podInfoWorkers int,
 func (s *AgentServer) setupRoutes() {
 	// eBPF 核心路径
 	s.router.HandleFunc("/api/ebpf/entry", s.handleEBPFEntry).Methods("POST", "DELETE")
+	s.router.HandleFunc("/api/ebpf/entries", s.handleEBPFClear).Methods("DELETE")
 
 	// Pod Info 路径
 	s.router.HandleFunc("/api/podinfo/add", s.handlePodInfoAdd).Methods("POST")
@@ -204,6 +206,41 @@ func (s *AgentServer) handleEBPFEntry(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"success"}`))
 	}
+}
+
+func (s *AgentServer) handleEBPFClear(w http.ResponseWriter, r *http.Request) {
+	s.recordRequestStart()
+	success := false
+	isTimeout := false
+
+	defer func() {
+		s.recordRequestEnd(success, isTimeout)
+	}()
+
+	select {
+	case s.semaphore <- struct{}{}:
+		defer func() { <-s.semaphore }()
+	case <-time.After(100 * time.Millisecond):
+		isTimeout = true
+		http.Error(w, "Server busy", http.StatusServiceUnavailable)
+		return
+	}
+
+	ebpfMap, err := s.getEBPFMap()
+	if err != nil {
+		http.Error(w, "eBPF map error", http.StatusServiceUnavailable)
+		return
+	}
+
+	deleted, err := pkg.ClearEBPFEntries(ebpfMap)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	success = true
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"success","deleted":` + strconv.Itoa(deleted) + `}`))
 }
 
 func (s *AgentServer) handlePodInfoAdd(w http.ResponseWriter, r *http.Request) {
