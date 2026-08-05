@@ -31,10 +31,22 @@ const (
 	EmuNetLabelKey      = "emunet.emunet.io/name"
 	EmuNetGroupLabelKey = "emunet.emunet.io/image-group"
 
+	PodCreateBatchSize = 100
+	PodDeleteBatchSize = 100
+
 	// 轮询间隔：未就绪时快，就绪后慢
 	SyncPeriodFast = 3 * time.Second
 	SyncPeriodSlow = 30 * time.Second
 )
+
+type podSyncResult struct {
+	Created  int
+	Updated  int
+	Deleted  int
+	Requeue  bool
+	Existing int
+	Desired  int
+}
 
 // Reconcile is the main loop
 func (r *EmuNetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -64,7 +76,8 @@ func (r *EmuNetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	// 1. Sync Pods (Create/Update/Delete)
-	if err := r.syncPods(ctx, emunet); err != nil {
+	syncResult, err := r.syncPods(ctx, emunet)
+	if err != nil {
 		logger.Error(err, "failed to sync pods")
 		return ctrl.Result{}, err
 	}
@@ -77,6 +90,11 @@ func (r *EmuNetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, err
 	}
 
+	if syncResult.Requeue {
+		logger.Info("pod sync is throttled; requeueing", "created", syncResult.Created, "updated", syncResult.Updated, "deleted", syncResult.Deleted, "existing", syncResult.Existing, "desired", syncResult.Desired)
+		return ctrl.Result{RequeueAfter: SyncPeriodFast}, nil
+	}
+
 	// 3. 智能轮询 (Smart Polling)
 	if isReady {
 		return ctrl.Result{RequeueAfter: SyncPeriodSlow}, nil
@@ -84,7 +102,7 @@ func (r *EmuNetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	return ctrl.Result{RequeueAfter: SyncPeriodFast}, nil
 }
 
-func (r *EmuNetReconciler) syncPods(ctx context.Context, emunet *emunetv1.EmuNet) error {
+func (r *EmuNetReconciler) syncPods(ctx context.Context, emunet *emunetv1.EmuNet) (podSyncResult, error) {
 	existingPods := &corev1.PodList{}
 	listOptions := []client.ListOption{
 		client.InNamespace(emunet.Namespace),
@@ -92,7 +110,7 @@ func (r *EmuNetReconciler) syncPods(ctx context.Context, emunet *emunetv1.EmuNet
 	}
 
 	if err := r.List(ctx, existingPods, listOptions...); err != nil {
-		return err
+		return podSyncResult{}, err
 	}
 
 	existingPodMap := make(map[string]*corev1.Pod)
@@ -101,6 +119,10 @@ func (r *EmuNetReconciler) syncPods(ctx context.Context, emunet *emunetv1.EmuNet
 	}
 
 	desiredPods := make(map[string]bool)
+	result := podSyncResult{
+		Existing: len(existingPodMap),
+		Desired:  int(desiredReplicaCount(emunet)),
+	}
 
 	// Reconcile desired state
 	for groupIdx, imageGroup := range emunet.Spec.ImageGroups {
@@ -111,13 +133,19 @@ func (r *EmuNetReconciler) syncPods(ctx context.Context, emunet *emunetv1.EmuNet
 			if existingPod, exists := existingPodMap[podName]; exists {
 				if existingPod.Spec.Containers[0].Image != imageGroup.Image {
 					if err := r.updateExistingPod(ctx, existingPod, imageGroup.Image); err != nil {
-						return err
+						return result, err
 					}
+					result.Updated++
 				}
 			} else {
-				if err := r.createNewPod(ctx, emunet, groupIdx, podIdx, imageGroup); err != nil {
-					return err
+				if result.Created >= PodCreateBatchSize {
+					result.Requeue = true
+					continue
 				}
+				if err := r.createNewPod(ctx, emunet, groupIdx, podIdx, imageGroup); err != nil {
+					return result, err
+				}
+				result.Created++
 			}
 		}
 	}
@@ -125,13 +153,18 @@ func (r *EmuNetReconciler) syncPods(ctx context.Context, emunet *emunetv1.EmuNet
 	// Cleanup extraneous pods
 	for podName, pod := range existingPodMap {
 		if !desiredPods[podName] && pod.DeletionTimestamp == nil {
-			if err := r.Delete(ctx, pod); err != nil && !errors.IsNotFound(err) {
-				return err
+			if result.Deleted >= PodDeleteBatchSize {
+				result.Requeue = true
+				continue
 			}
+			if err := r.Delete(ctx, pod); err != nil && !errors.IsNotFound(err) {
+				return result, err
+			}
+			result.Deleted++
 		}
 	}
 
-	return nil
+	return result, nil
 }
 
 // updateStatus returns (isReady, error)
@@ -157,11 +190,12 @@ func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.Em
 	// [关键] 从 Redis 拉取最新 MAC 信息
 	imageGroupStatus, totalReady, allMacsFound := r.calculateImageGroupStatus(ctx, emunet, podMap)
 	summary := buildRedisSummary(emunet, imageGroupStatus, totalReady)
+	desiredReplicas := desiredReplicaCount(emunet)
 
 	// 1. Update K8s Status (Optimistic Locking via Patch)
 	newStatus := emunet.Status.DeepCopy()
 	newStatus.ReadyReplicas = totalReady
-	newStatus.DesiredReplicas = emunet.Spec.TotalReplicas
+	newStatus.DesiredReplicas = desiredReplicas
 	newStatus.ImageGroupStatus = compactImageGroupStatus(imageGroupStatus)
 	newStatus.ObservedGen = emunet.Generation
 
@@ -172,7 +206,7 @@ func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.Em
 		if err := r.Status().Patch(ctx, emunet, patch); err != nil {
 			return false, err
 		}
-		logger.Info("updated emunet status", "ready", totalReady, "target", emunet.Spec.TotalReplicas)
+		logger.Info("updated emunet status", "ready", totalReady, "target", desiredReplicas)
 	}
 
 	// 2. Update Redis
@@ -181,7 +215,7 @@ func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.Em
 		Name:             emunet.Name,
 		Namespace:        emunet.Namespace,
 		ReadyReplicas:    totalReady,
-		DesiredReplicas:  emunet.Spec.TotalReplicas,
+		DesiredReplicas:  desiredReplicas,
 		ObservedGen:      emunet.Generation,
 		ImageGroupStatus: convertImageGroupStatus(imageGroupStatus),
 		LastUpdated:      time.Now(),
@@ -192,7 +226,7 @@ func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.Em
 	}
 
 	// 判断系统是否完全就绪
-	isFullyReady := (totalReady == emunet.Spec.TotalReplicas) && allMacsFound
+	isFullyReady := (totalReady == desiredReplicas) && allMacsFound
 	return isFullyReady, nil
 }
 
@@ -226,6 +260,12 @@ func (r *EmuNetReconciler) calculateImageGroupStatus(ctx context.Context, emunet
 	var imageGroupStatus []emunetv1.ImageGroupStatus
 	var totalReady int32
 	allMacsFound := true
+	desiredPodNames := desiredPodNames(emunet)
+	agentInfo, err := r.Redis.GetAgentNetworkInfoBatch(ctx, desiredPodNames)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "failed to read agent network cache")
+		agentInfo = map[string]*redis.PodStatus{}
+	}
 
 	for groupIdx, imageGroup := range emunet.Spec.ImageGroups {
 		groupStatus := emunetv1.ImageGroupStatus{
@@ -254,9 +294,8 @@ func (r *EmuNetReconciler) calculateImageGroupStatus(ctx context.Context, emunet
 				podStatus.Message = getPodMessage(pod)
 
 				// 3. [核心修改] 尝试从 Agent 专用 Key 读取 MAC/IfIndex
-				// 使用 GetAgentNetworkInfo (agent:network:...)
-				redisInfo, err := r.Redis.GetAgentNetworkInfo(ctx, podName)
-				if err == nil && redisInfo != nil {
+				// 使用批量读取的 agent:network:* 缓存，避免大规模 Pod 时逐个 Redis 往返。
+				if redisInfo := agentInfo[podName]; redisInfo != nil {
 					if redisInfo.MACAddress != "" {
 						podStatus.MACAddress = redisInfo.MACAddress
 					}
@@ -280,6 +319,24 @@ func (r *EmuNetReconciler) calculateImageGroupStatus(ctx context.Context, emunet
 		imageGroupStatus = append(imageGroupStatus, groupStatus)
 	}
 	return imageGroupStatus, totalReady, allMacsFound
+}
+
+func desiredReplicaCount(emunet *emunetv1.EmuNet) int32 {
+	var total int32
+	for _, group := range emunet.Spec.ImageGroups {
+		total += group.Replicas
+	}
+	return total
+}
+
+func desiredPodNames(emunet *emunetv1.EmuNet) []string {
+	podNames := make([]string, 0, desiredReplicaCount(emunet))
+	for groupIdx, imageGroup := range emunet.Spec.ImageGroups {
+		for podIdx := int32(0); podIdx < imageGroup.Replicas; podIdx++ {
+			podNames = append(podNames, fmt.Sprintf("%s-group%d-%d", emunet.Name, groupIdx, podIdx))
+		}
+	}
+	return podNames
 }
 
 func (r *EmuNetReconciler) updateExistingPod(ctx context.Context, pod *corev1.Pod, desiredImage string) error {
@@ -386,7 +443,7 @@ func buildRedisSummary(emunet *emunetv1.EmuNet, imageGroupStatus []emunetv1.Imag
 	return &redis.EmuNetSummary{
 		Name:              emunet.Name,
 		Namespace:         emunet.Namespace,
-		DesiredReplicas:   emunet.Spec.TotalReplicas,
+		DesiredReplicas:   desiredReplicaCount(emunet),
 		ReadyReplicas:     totalReady,
 		RunningReplicas:   runningReplicas,
 		MACSyncedReplicas: macSyncedReplicas,

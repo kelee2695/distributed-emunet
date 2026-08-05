@@ -5,9 +5,14 @@
 ## 使用的后端接口
 
 - `GET /api/v1/health`
-- `GET /api/v1/emunets/{namespace}/{name}/pods`
+- `GET /api/v1/emunets`
+- `POST /api/v1/emunets`
+- `POST /api/v1/emunets/{namespace}/{name}/stop`
+- `GET /api/v1/emunets/{namespace}/{name}/summary`
+- `GET /api/v1/emunets/{namespace}/{name}/pods?offset=0&limit=100`
 - `POST /api/v1/ebpf/entry/by-pods`
 - `DELETE /api/v1/ebpf/entry/by-pods`
+- `POST /api/v1/ping/by-pods`
 
 重新构建并部署 LinkServer 后，打开 `http://<master-ip>:30082/` 即可使用。页面会自动把 LinkServer 地址设置为当前访问地址。
 

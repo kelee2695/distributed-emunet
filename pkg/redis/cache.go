@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -38,6 +39,38 @@ func (c *Client) GetAgentNetworkInfo(ctx context.Context, podName string) (*PodS
 		return nil, err
 	}
 	return &pod, nil
+}
+
+func (c *Client) GetAgentNetworkInfoBatch(ctx context.Context, podNames []string) (map[string]*PodStatus, error) {
+	result := make(map[string]*PodStatus, len(podNames))
+	if len(podNames) == 0 {
+		return result, nil
+	}
+
+	pipe := c.client.Pipeline()
+	cmds := make(map[string]*redis.StringCmd, len(podNames))
+	for _, podName := range podNames {
+		key := fmt.Sprintf("agent:network:%s", podName)
+		cmds[podName] = pipe.Get(ctx, key)
+	}
+
+	_, err := pipe.Exec(ctx)
+	if err != nil && err != redis.Nil {
+		return nil, err
+	}
+
+	for podName, cmd := range cmds {
+		data, err := cmd.Result()
+		if err != nil {
+			continue
+		}
+		var pod PodStatus
+		if json.Unmarshal([]byte(data), &pod) == nil {
+			result[podName] = &pod
+		}
+	}
+
+	return result, nil
 }
 
 func (c *Client) SaveStatusBatch(ctx context.Context, emunet *EmuNetStatus, pods []PodStatus, summary *EmuNetSummary) error {
@@ -158,15 +191,37 @@ func (c *Client) GetPodInfoDirectly(ctx context.Context, podName string) (*PodSt
 }
 
 func (c *Client) ListPodStatuses(ctx context.Context, namespace, name string) ([]PodStatus, error) {
+	pods, _, err := c.ListPodStatusesPage(ctx, namespace, name, 0, 0)
+	return pods, err
+}
+
+func (c *Client) ListPodStatusesPage(ctx context.Context, namespace, name string, offset, limit int) ([]PodStatus, int, error) {
 	indexKey := fmt.Sprintf("emunet:%s:%s:pods", namespace, name)
 	podNames, err := c.client.SMembers(ctx, indexKey).Result()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	if len(podNames) == 0 {
-		return []PodStatus{}, nil
+		return []PodStatus{}, 0, nil
 	}
+	sort.Strings(podNames)
+
+	total := len(podNames)
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = total
+	}
+	if offset > total {
+		offset = total
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	podNames = podNames[offset:end]
 
 	pipe := c.client.Pipeline()
 	cmds := make([]*redis.StringCmd, len(podNames))
@@ -178,7 +233,7 @@ func (c *Client) ListPodStatuses(ctx context.Context, namespace, name string) ([
 
 	_, err = pipe.Exec(ctx)
 	if err != nil && err != redis.Nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	var pods []PodStatus
@@ -192,5 +247,5 @@ func (c *Client) ListPodStatuses(ctx context.Context, namespace, name string) ([
 		}
 	}
 
-	return pods, nil
+	return pods, total, nil
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -98,6 +99,13 @@ type EmuNetRuntimeSummary struct {
 	NodeCount         int32     `json:"nodeCount"`
 	ObservedGen       int64     `json:"observedGen"`
 	LastUpdated       time.Time `json:"lastUpdated"`
+}
+
+type PodListResponse struct {
+	Items  []redis.PodStatus `json:"items"`
+	Total  int               `json:"total"`
+	Offset int               `json:"offset"`
+	Limit  int               `json:"limit"`
 }
 
 type Response struct {
@@ -529,28 +537,45 @@ func (s *MasterServer) deleteEmuNet(w http.ResponseWriter, r *http.Request) {
 		s.sendError(w, http.StatusInternalServerError, "Failed to get EmuNet")
 		return
 	}
+	podCount, countErr := s.countOwnedPods(r.Context(), vars["namespace"], vars["name"])
+	if countErr != nil {
+		s.logger.Warn("failed to count pods for delete progress", zap.Error(countErr))
+	}
+
 	if err := s.k8sClient.Delete(r.Context(), emunet); err != nil && !apierrors.IsNotFound(err) {
 		s.logger.Error("failed to delete emunet", zap.Error(err))
 		s.sendError(w, http.StatusInternalServerError, "Failed to stop EmuNet")
 		return
 	}
-	s.sendSuccess(w, map[string]string{"status": "stopping"})
+	s.sendSuccess(w, map[string]interface{}{
+		"status":       "stopping",
+		"deletingPods": podCount,
+	})
 }
 
 func (s *MasterServer) listPodsFromCache(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	ns := vars["namespace"]
 	name := vars["name"]
+	offset := parseNonNegativeQueryInt(r, "offset", 0)
+	limit := parseNonNegativeQueryInt(r, "limit", 100)
+	if limit == 0 || limit > 500 {
+		limit = 500
+	}
 
-	// 直接从 Redis 集合中读取，这要求 Controller 维护好 "emunet:pods:{ns}:{name}" 这个 Set
-	pods, err := s.redis.ListPodStatuses(r.Context(), ns, name)
+	pods, total, err := s.redis.ListPodStatusesPage(r.Context(), ns, name, offset, limit)
 	if err != nil {
 		s.logger.Error("Redis list error", zap.Error(err))
 		s.sendError(w, http.StatusInternalServerError, "Failed to retrieve pod list")
 		return
 	}
 
-	s.sendSuccess(w, pods)
+	s.sendSuccess(w, PodListResponse{
+		Items:  pods,
+		Total:  total,
+		Offset: offset,
+		Limit:  limit,
+	})
 }
 
 func (s *MasterServer) healthCheck(w http.ResponseWriter, r *http.Request) {
@@ -603,10 +628,11 @@ func convertImageGroups(groups []EmuNetImageGroup) []emunetv1.ImageGroup {
 }
 
 func summarizeEmuNet(em *emunetv1.EmuNet) EmuNetSummary {
+	total := desiredReplicaCount(em.Spec.ImageGroups)
 	return EmuNetSummary{
 		Namespace:       em.Namespace,
 		Name:            em.Name,
-		TotalReplicas:   em.Spec.TotalReplicas,
+		TotalReplicas:   total,
 		ReadyReplicas:   em.Status.ReadyReplicas,
 		DesiredReplicas: em.Status.DesiredReplicas,
 		ImageGroups:     summarizeImageGroups(em.Spec.ImageGroups),
@@ -623,6 +649,37 @@ func summarizeImageGroups(groups []emunetv1.ImageGroup) []EmuNetImageGroup {
 		})
 	}
 	return result
+}
+
+func desiredReplicaCount(groups []emunetv1.ImageGroup) int32 {
+	var total int32
+	for _, group := range groups {
+		total += group.Replicas
+	}
+	return total
+}
+
+func parseNonNegativeQueryInt(r *http.Request, key string, fallback int) int {
+	raw := r.URL.Query().Get(key)
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 0 {
+		return fallback
+	}
+	return value
+}
+
+func (s *MasterServer) countOwnedPods(ctx context.Context, namespace, name string) (int, error) {
+	pods := &corev1.PodList{}
+	if err := s.k8sClient.List(ctx, pods,
+		client.InNamespace(namespace),
+		client.MatchingLabels{"emunet.emunet.io/name": name},
+	); err != nil {
+		return 0, err
+	}
+	return len(pods.Items), nil
 }
 
 // =================================================================================

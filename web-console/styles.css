@@ -363,6 +363,8 @@ tr:last-child td {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .check-row {
@@ -373,6 +375,16 @@ tr:last-child td {
 
 .check-row input {
   width: auto;
+}
+
+.page-size-label {
+  align-items: center;
+  display: flex;
+  gap: 6px;
+}
+
+#pod-page-size {
+  width: 86px;
 }
 
 .metric-row {

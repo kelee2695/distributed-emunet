@@ -22,6 +22,9 @@ const el = {
   stopEmuNet: document.querySelector("#stop-emunet"),
   emunetList: document.querySelector("#emunet-list"),
   refreshPods: document.querySelector("#refresh-pods"),
+  prevPods: document.querySelector("#prev-pods"),
+  nextPods: document.querySelector("#next-pods"),
+  podPageSize: document.querySelector("#pod-page-size"),
   autoRefresh: document.querySelector("#auto-refresh"),
   podSummary: document.querySelector("#pod-summary"),
   podTable: document.querySelector("#pod-table"),
@@ -49,6 +52,11 @@ let pods = [];
 let emunets = [];
 let refreshTimer = null;
 let detailLoaded = false;
+let podPage = {
+  offset: 0,
+  limit: 100,
+  total: 0,
+};
 
 function init() {
   const sameOriginUrl = window.location.protocol.startsWith("http") ? window.location.origin : el.linkserverUrl.value;
@@ -66,7 +74,13 @@ function init() {
   });
   el.startEmuNet.addEventListener("click", startEmuNet);
   el.stopEmuNet.addEventListener("click", stopEmuNet);
-  el.refreshPods.addEventListener("click", refreshPods);
+  el.refreshPods.addEventListener("click", () => refreshPods({ resetPage: true }));
+  el.prevPods.addEventListener("click", () => changePodPage(-1));
+  el.nextPods.addEventListener("click", () => changePodPage(1));
+  el.podPageSize.addEventListener("change", () => {
+    podPage.limit = numberValue(el.podPageSize) || 100;
+    refreshPods({ resetPage: true });
+  });
   el.autoRefresh.addEventListener("change", configureAutoRefresh);
   el.applyRule.addEventListener("click", applyRule);
   el.deleteRule.addEventListener("click", deleteRule);
@@ -186,8 +200,10 @@ async function stopEmuNet() {
   el.stopEmuNet.disabled = true;
   el.emunetStatus.textContent = "正在关闭";
   try {
-    await api(`/api/v1/emunets/${ns}/${name}/stop`, { method: "POST" });
-    el.emunetStatus.textContent = "关闭请求已提交";
+    const payload = await api(`/api/v1/emunets/${ns}/${name}/stop`, { method: "POST" });
+    const deletingPods = payload.data?.deletingPods;
+    el.emunetStatus.textContent =
+      Number.isFinite(deletingPods) && deletingPods > 0 ? `关闭请求已提交，正在删除 ${deletingPods} 个 Pod` : "关闭请求已提交";
     clearPodDetails("实例关闭中");
     await refreshEmuNets();
     await refreshSummary();
@@ -198,7 +214,7 @@ async function stopEmuNet() {
   }
 }
 
-async function refreshPods() {
+async function refreshPods(options = {}) {
   saveConfig();
   const ns = encodeURIComponent(el.namespace.value.trim() || "default");
   const name = encodeURIComponent(el.emunetName.value.trim());
@@ -206,10 +222,25 @@ async function refreshPods() {
     el.podSummary.textContent = "请选择 EmuNet";
     return;
   }
+  if (options.resetPage) {
+    podPage.offset = 0;
+  }
+  podPage.limit = numberValue(el.podPageSize) || podPage.limit || 100;
   el.podSummary.textContent = "正在读取 Pod 状态";
   try {
-    const payload = await api(`/api/v1/emunets/${ns}/${name}/pods`);
-    pods = Array.isArray(payload.data) ? payload.data : [];
+    const payload = await api(`/api/v1/emunets/${ns}/${name}/pods?offset=${podPage.offset}&limit=${podPage.limit}`);
+    const data = payload.data || {};
+    if (Array.isArray(data)) {
+      pods = data;
+      podPage.total = data.length;
+      podPage.offset = 0;
+      podPage.limit = data.length || podPage.limit;
+    } else {
+      pods = Array.isArray(data.items) ? data.items : [];
+      podPage.total = Number(data.total || 0);
+      podPage.offset = Number(data.offset || 0);
+      podPage.limit = Number(data.limit || podPage.limit);
+    }
     detailLoaded = true;
     renderPods();
     renderPodSelects();
@@ -272,11 +303,14 @@ function renderSummary(summary) {
 function clearPodDetails(message) {
   pods = [];
   detailLoaded = false;
+  podPage.offset = 0;
+  podPage.total = 0;
   el.metricMac.textContent = "-";
   el.metricNodes.textContent = "-";
   el.podSummary.textContent = message;
   el.podTable.innerHTML = `<tr><td colspan="6" class="empty">点击“刷新详情”加载 Pod 表</td></tr>`;
   renderPodSelects();
+  updatePodPager();
 }
 
 function renderPods() {
@@ -294,10 +328,13 @@ function renderPods() {
   if (!pods.length) {
     el.podSummary.textContent = "暂无 Pod 数据";
     el.podTable.innerHTML = `<tr><td colspan="6" class="empty">暂无数据</td></tr>`;
+    updatePodPager();
     return;
   }
 
-  el.podSummary.textContent = `${ready}/${pods.length} Ready, ${withMac}/${pods.length} 已同步 MAC`;
+  const start = podPage.offset + 1;
+  const end = podPage.offset + pods.length;
+  el.podSummary.textContent = `第 ${start}-${end} / ${podPage.total || pods.length} 个 Pod；本页 ${ready}/${pods.length} Ready, ${withMac}/${pods.length} 已同步 MAC`;
   el.podTable.innerHTML = pods
     .map(
       (pod) => `
@@ -312,6 +349,26 @@ function renderPods() {
       `,
     )
     .join("");
+  updatePodPager();
+}
+
+function changePodPage(direction) {
+  if (!detailLoaded) {
+    refreshPods({ resetPage: true });
+    return;
+  }
+  const nextOffset = podPage.offset + direction * podPage.limit;
+  if (nextOffset < 0 || nextOffset >= podPage.total) {
+    return;
+  }
+  podPage.offset = nextOffset;
+  refreshPods();
+}
+
+function updatePodPager() {
+  const hasDetails = detailLoaded && podPage.total > 0;
+  el.prevPods.disabled = !hasDetails || podPage.offset <= 0;
+  el.nextPods.disabled = !hasDetails || podPage.offset + pods.length >= podPage.total;
 }
 
 function renderPodSelects() {
