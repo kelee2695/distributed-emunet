@@ -48,6 +48,7 @@ const el = {
 let pods = [];
 let emunets = [];
 let refreshTimer = null;
+let detailLoaded = false;
 
 function init() {
   const sameOriginUrl = window.location.protocol.startsWith("http") ? window.location.origin : el.linkserverUrl.value;
@@ -165,7 +166,8 @@ async function startEmuNet() {
     el.emunetStatus.textContent = payload.data?.status === "created" ? "实例已创建" : "实例已更新";
     saveConfig();
     await refreshEmuNets();
-    await refreshPods();
+    clearPodDetails("Pod 详情未加载；自动刷新只更新摘要");
+    await refreshSummary();
   } catch (err) {
     el.emunetStatus.textContent = shortError(err);
   } finally {
@@ -186,10 +188,9 @@ async function stopEmuNet() {
   try {
     await api(`/api/v1/emunets/${ns}/${name}/stop`, { method: "POST" });
     el.emunetStatus.textContent = "关闭请求已提交";
-    pods = [];
-    renderPods();
-    renderPodSelects();
+    clearPodDetails("实例关闭中");
     await refreshEmuNets();
+    await refreshSummary();
   } catch (err) {
     el.emunetStatus.textContent = shortError(err);
   } finally {
@@ -209,14 +210,13 @@ async function refreshPods() {
   try {
     const payload = await api(`/api/v1/emunets/${ns}/${name}/pods`);
     pods = Array.isArray(payload.data) ? payload.data : [];
+    detailLoaded = true;
     renderPods();
     renderPodSelects();
     updateSelectedStatus();
   } catch (err) {
-    pods = [];
+    clearPodDetails(shortError(err));
     el.podSummary.textContent = shortError(err);
-    renderPods();
-    renderPodSelects();
   }
 }
 
@@ -255,7 +255,6 @@ function configureAutoRefresh() {
   if (el.autoRefresh.checked) {
     refreshTimer = setInterval(() => {
       refreshSummary();
-      refreshEmuNets();
     }, 5000);
   }
 }
@@ -263,11 +262,21 @@ function configureAutoRefresh() {
 function renderSummary(summary) {
   el.metricDesired.textContent = String(summary.desiredReplicas || 0);
   el.metricReady.textContent = String(summary.readyReplicas || 0);
-  el.metricMac.textContent = pods.length ? String(pods.filter((pod) => pod.macAddress).length) : "-";
-  el.metricNodes.textContent = pods.length ? String(new Set(pods.map((pod) => pod.nodeName).filter(Boolean)).size) : "-";
+  el.metricMac.textContent = detailLoaded ? String(pods.filter((pod) => pod.macAddress).length) : "-";
+  el.metricNodes.textContent = detailLoaded ? String(new Set(pods.map((pod) => pod.nodeName).filter(Boolean)).size) : "-";
   if (summary.desiredReplicas || summary.readyReplicas) {
     el.podSummary.textContent = `${summary.readyReplicas || 0}/${summary.desiredReplicas || 0} Ready`;
   }
+}
+
+function clearPodDetails(message) {
+  pods = [];
+  detailLoaded = false;
+  el.metricMac.textContent = "-";
+  el.metricNodes.textContent = "-";
+  el.podSummary.textContent = message;
+  el.podTable.innerHTML = `<tr><td colspan="6" class="empty">点击“刷新详情”加载 Pod 表</td></tr>`;
+  renderPodSelects();
 }
 
 function renderPods() {
@@ -354,7 +363,8 @@ function selectEmuNet(namespace, name) {
   }
   saveConfig();
   renderEmuNetList();
-  refreshPods();
+  clearPodDetails("Pod 详情未加载；自动刷新只更新摘要");
+  refreshSummary();
 }
 
 function updateSelectedStatus() {
