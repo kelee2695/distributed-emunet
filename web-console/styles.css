@@ -402,6 +402,10 @@ tr:last-child td {
   line-height: 1;
 }
 
+.metric-row strong:empty::after {
+  content: "-";
+}
+
 .block {
   border: 1px dashed var(--line);
   border-radius: 8px;

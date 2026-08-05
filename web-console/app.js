@@ -74,7 +74,7 @@ function init() {
   saveConfig();
   checkHealth();
   refreshEmuNets();
-  refreshPods();
+  refreshSummary();
   configureAutoRefresh();
 }
 
@@ -220,6 +220,33 @@ async function refreshPods() {
   }
 }
 
+async function refreshSummary() {
+  saveConfig();
+  const ns = encodeURIComponent(el.namespace.value.trim() || "default");
+  const name = encodeURIComponent(el.emunetName.value.trim());
+  if (!name) {
+    el.podSummary.textContent = "请选择 EmuNet";
+    return;
+  }
+
+  try {
+    const payload = await api(`/api/v1/emunets/${ns}/${name}/summary`);
+    renderSummary(payload.data || {});
+  } catch (err) {
+    const selected = findSelectedEmuNet();
+    if (selected) {
+      renderSummary({
+        desiredReplicas: selected.desiredReplicas || selected.totalReplicas || 0,
+        readyReplicas: selected.readyReplicas || 0,
+      });
+      el.podSummary.textContent = "等待 controller 写入摘要";
+    } else {
+      renderSummary({});
+      el.podSummary.textContent = shortError(err);
+    }
+  }
+}
+
 function configureAutoRefresh() {
   if (refreshTimer) {
     clearInterval(refreshTimer);
@@ -227,9 +254,19 @@ function configureAutoRefresh() {
   }
   if (el.autoRefresh.checked) {
     refreshTimer = setInterval(() => {
-      refreshPods();
+      refreshSummary();
       refreshEmuNets();
     }, 5000);
+  }
+}
+
+function renderSummary(summary) {
+  el.metricDesired.textContent = String(summary.desiredReplicas || 0);
+  el.metricReady.textContent = String(summary.readyReplicas || 0);
+  el.metricMac.textContent = pods.length ? String(pods.filter((pod) => pod.macAddress).length) : "-";
+  el.metricNodes.textContent = pods.length ? String(new Set(pods.map((pod) => pod.nodeName).filter(Boolean)).size) : "-";
+  if (summary.desiredReplicas || summary.readyReplicas) {
+    el.podSummary.textContent = `${summary.readyReplicas || 0}/${summary.desiredReplicas || 0} Ready`;
   }
 }
 
