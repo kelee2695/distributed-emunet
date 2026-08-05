@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -13,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	controlleropts "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -22,8 +24,16 @@ import (
 
 type EmuNetReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	Redis  *redis.Client
+	Scheme                  *runtime.Scheme
+	Redis                   *redis.Client
+	PodCreateBatchSize      int
+	PodDeleteBatchSize      int
+	FullStatusSyncPeriod    time.Duration
+	MaxConcurrentReconciles int
+
+	statusWriteMu            sync.Mutex
+	lastFullStatusWrite      map[string]time.Time
+	lastFullStatusGeneration map[string]int64
 }
 
 const (
@@ -31,12 +41,12 @@ const (
 	EmuNetLabelKey      = "emunet.emunet.io/name"
 	EmuNetGroupLabelKey = "emunet.emunet.io/image-group"
 
-	PodCreateBatchSize = 100
-	PodDeleteBatchSize = 100
-
 	// 轮询间隔：未就绪时快，就绪后慢
-	SyncPeriodFast = 3 * time.Second
-	SyncPeriodSlow = 30 * time.Second
+	SyncPeriodFast        = 3 * time.Second
+	SyncPeriodSlow        = 30 * time.Second
+	DefaultPodCreateBatch = 100
+	DefaultPodDeleteBatch = 100
+	DefaultFullStatusSync = 15 * time.Second
 )
 
 type podSyncResult struct {
@@ -46,6 +56,7 @@ type podSyncResult struct {
 	Requeue  bool
 	Existing int
 	Desired  int
+	PodMap   map[string]*corev1.Pod
 }
 
 // Reconcile is the main loop
@@ -84,7 +95,7 @@ func (r *EmuNetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	// 2. Update Status (K8s Status & Redis Cache)
 	// 这个方法现在返回一个 bool，指示系统是否已经完全 Ready
-	isReady, err := r.updateStatus(ctx, emunet)
+	isReady, err := r.updateStatus(ctx, emunet, syncResult)
 	if err != nil {
 		logger.Error(err, "failed to update status")
 		return ctrl.Result{}, err
@@ -122,6 +133,7 @@ func (r *EmuNetReconciler) syncPods(ctx context.Context, emunet *emunetv1.EmuNet
 	result := podSyncResult{
 		Existing: len(existingPodMap),
 		Desired:  int(desiredReplicaCount(emunet)),
+		PodMap:   existingPodMap,
 	}
 
 	// Reconcile desired state
@@ -138,7 +150,7 @@ func (r *EmuNetReconciler) syncPods(ctx context.Context, emunet *emunetv1.EmuNet
 					result.Updated++
 				}
 			} else {
-				if result.Created >= PodCreateBatchSize {
+				if result.Created >= r.podCreateBatchSize() {
 					result.Requeue = true
 					continue
 				}
@@ -153,7 +165,7 @@ func (r *EmuNetReconciler) syncPods(ctx context.Context, emunet *emunetv1.EmuNet
 	// Cleanup extraneous pods
 	for podName, pod := range existingPodMap {
 		if !desiredPods[podName] && pod.DeletionTimestamp == nil {
-			if result.Deleted >= PodDeleteBatchSize {
+			if result.Deleted >= r.podDeleteBatchSize() {
 				result.Requeue = true
 				continue
 			}
@@ -168,23 +180,12 @@ func (r *EmuNetReconciler) syncPods(ctx context.Context, emunet *emunetv1.EmuNet
 }
 
 // updateStatus returns (isReady, error)
-func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.EmuNet) (bool, error) {
+func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.EmuNet, syncResult podSyncResult) (bool, error) {
 	logger := log.FromContext(ctx)
+	podMap := syncResult.PodMap
 
-	// Fetch latest pods
-	pods := &corev1.PodList{}
-	listOptions := []client.ListOption{
-		client.InNamespace(emunet.Namespace),
-		client.MatchingLabels{EmuNetLabelKey: emunet.Name},
-	}
-	if err := r.List(ctx, pods, listOptions...); err != nil {
-		return false, err
-	}
-
-	// Calculate Status
-	podMap := make(map[string]*corev1.Pod, len(pods.Items))
-	for i := range pods.Items {
-		podMap[pods.Items[i].Name] = &pods.Items[i]
+	if podMap == nil {
+		podMap = map[string]*corev1.Pod{}
 	}
 
 	// [关键] 从 Redis 拉取最新 MAC 信息
@@ -221,7 +222,8 @@ func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.Em
 		LastUpdated:      time.Now(),
 	}
 
-	if err := r.saveStatusToRedis(ctx, redisStatus, summary); err != nil {
+	forceFullStatusWrite := syncResult.Created > 0 || syncResult.Updated > 0 || syncResult.Deleted > 0
+	if err := r.saveStatusToRedis(ctx, emunet, redisStatus, summary, forceFullStatusWrite); err != nil {
 		logger.Error(err, "failed to update redis cache")
 	}
 
@@ -230,7 +232,11 @@ func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.Em
 	return isFullyReady, nil
 }
 
-func (r *EmuNetReconciler) saveStatusToRedis(ctx context.Context, status *redis.EmuNetStatus, summary *redis.EmuNetSummary) error {
+func (r *EmuNetReconciler) saveStatusToRedis(ctx context.Context, emunet *emunetv1.EmuNet, status *redis.EmuNetStatus, summary *redis.EmuNetSummary, forceFull bool) error {
+	if !r.shouldWriteFullStatus(emunet, forceFull) {
+		return r.Redis.SaveSummary(ctx, summary)
+	}
+
 	var allPods []redis.PodStatus
 	for _, group := range status.ImageGroupStatus {
 		for _, pod := range group.PodStatuses {
@@ -238,6 +244,49 @@ func (r *EmuNetReconciler) saveStatusToRedis(ctx context.Context, status *redis.
 		}
 	}
 	return r.Redis.SaveStatusBatch(ctx, status, allPods, summary)
+}
+
+func (r *EmuNetReconciler) shouldWriteFullStatus(emunet *emunetv1.EmuNet, force bool) bool {
+	r.statusWriteMu.Lock()
+	defer r.statusWriteMu.Unlock()
+
+	if r.lastFullStatusWrite == nil {
+		r.lastFullStatusWrite = map[string]time.Time{}
+	}
+	if r.lastFullStatusGeneration == nil {
+		r.lastFullStatusGeneration = map[string]int64{}
+	}
+
+	key := fmt.Sprintf("%s/%s", emunet.Namespace, emunet.Name)
+	now := time.Now()
+	period := r.fullStatusSyncPeriod()
+	if force || r.lastFullStatusGeneration[key] != emunet.Generation || now.Sub(r.lastFullStatusWrite[key]) >= period {
+		r.lastFullStatusWrite[key] = now
+		r.lastFullStatusGeneration[key] = emunet.Generation
+		return true
+	}
+	return false
+}
+
+func (r *EmuNetReconciler) podCreateBatchSize() int {
+	if r.PodCreateBatchSize > 0 {
+		return r.PodCreateBatchSize
+	}
+	return DefaultPodCreateBatch
+}
+
+func (r *EmuNetReconciler) podDeleteBatchSize() int {
+	if r.PodDeleteBatchSize > 0 {
+		return r.PodDeleteBatchSize
+	}
+	return DefaultPodDeleteBatch
+}
+
+func (r *EmuNetReconciler) fullStatusSyncPeriod() time.Duration {
+	if r.FullStatusSyncPeriod > 0 {
+		return r.FullStatusSyncPeriod
+	}
+	return DefaultFullStatusSync
 }
 
 func (r *EmuNetReconciler) handleDeletion(ctx context.Context, nn types.NamespacedName, emunet *emunetv1.EmuNet) (ctrl.Result, error) {
@@ -249,8 +298,18 @@ func (r *EmuNetReconciler) handleDeletion(ctx context.Context, nn types.Namespac
 	if err := r.Update(ctx, emunet); err != nil {
 		return ctrl.Result{}, err
 	}
+	r.forgetStatusWriteState(nn)
 
 	return ctrl.Result{}, nil
+}
+
+func (r *EmuNetReconciler) forgetStatusWriteState(nn types.NamespacedName) {
+	r.statusWriteMu.Lock()
+	defer r.statusWriteMu.Unlock()
+
+	key := fmt.Sprintf("%s/%s", nn.Namespace, nn.Name)
+	delete(r.lastFullStatusWrite, key)
+	delete(r.lastFullStatusGeneration, key)
 }
 
 // --- Helpers ---
@@ -472,8 +531,13 @@ func getPodMessage(pod *corev1.Pod) string {
 }
 
 func (r *EmuNetReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	maxConcurrent := r.MaxConcurrentReconciles
+	if maxConcurrent <= 0 {
+		maxConcurrent = 1
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&emunetv1.EmuNet{}).
 		Owns(&corev1.Pod{}).
+		WithOptions(controlleropts.Options{MaxConcurrentReconciles: maxConcurrent}).
 		Complete(r)
 }

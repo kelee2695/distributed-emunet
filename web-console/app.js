@@ -207,10 +207,29 @@ async function stopEmuNet() {
     clearPodDetails("实例关闭中");
     await refreshEmuNets();
     await refreshSummary();
+    monitorStopProgress(ns, name);
   } catch (err) {
     el.emunetStatus.textContent = shortError(err);
   } finally {
     el.stopEmuNet.disabled = false;
+  }
+}
+
+async function monitorStopProgress(ns, name) {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    await sleep(3000);
+    try {
+      const payload = await api(`/api/v1/emunets/${ns}/${name}/delete-status`);
+      const remainingPods = Number(payload.data?.remainingPods || 0);
+      if (remainingPods <= 0) {
+        el.emunetStatus.textContent = "实例已关闭";
+        await refreshEmuNets();
+        return;
+      }
+      el.emunetStatus.textContent = `实例关闭中，还剩 ${remainingPods} 个 Pod`;
+    } catch {
+      return;
+    }
   }
 }
 
@@ -589,6 +608,12 @@ function describeImageGroups(groups) {
 function shortError(err) {
   const msg = err?.message || String(err);
   return msg.length > 36 ? `${msg.slice(0, 33)}...` : msg;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
 }
 
 function escapeHtml(value) {

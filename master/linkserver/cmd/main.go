@@ -32,11 +32,13 @@ func main() {
 	var redisDB int
 	var devMode bool
 	var webDir string
+	var pingConcurrency int
 
 	// 基础配置
 	flag.StringVar(&apiAddr, "api-bind-address", ":8082", "The address the REST API endpoint binds to.")
 	flag.BoolVar(&devMode, "dev", true, "Enable development mode logging")
 	flag.StringVar(&webDir, "web-dir", "web-console", "Static web console directory. Set empty to disable.")
+	flag.IntVar(&pingConcurrency, "ping-concurrency", 2, "Maximum concurrent Kubernetes exec ping tests.")
 
 	// Redis 配置
 	flag.StringVar(&redisAddr, "redis-addr", "localhost:6379", "Redis server address")
@@ -85,14 +87,14 @@ func main() {
 	}
 
 	// 4. 初始化业务逻辑
-	apiHandler := api.NewMasterServer(redisClient, k8sClient, clientset, restConfig, logger, webDir)
+	apiHandler := api.NewMasterServer(redisClient, k8sClient, clientset, restConfig, logger, webDir, pingConcurrency)
 
 	// 5. 启动 HTTP Server
 	server := &http.Server{
 		Addr:         apiAddr,
 		Handler:      apiHandler.GetRouter(),
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 120 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 

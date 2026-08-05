@@ -100,6 +100,7 @@ spec:
             - --api-bind-address=:8082
             # 【注意】Redis 地址
             - --redis-addr=emunet-redis.kube-system:6379
+            - --ping-concurrency=2
           
           ports:
             - containerPort: 8082
@@ -108,10 +109,24 @@ spec:
           resources:
             limits:
               cpu: 500m
-              memory: 256Mi
+              memory: 384Mi
             requests:
-              cpu: 10m
-              memory: 64Mi
+              cpu: 50m
+              memory: 96Mi
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8082
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8082
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
 
 ---
 # -----------------------------------------------------------------------------

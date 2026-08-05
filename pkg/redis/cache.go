@@ -77,7 +77,7 @@ func (c *Client) SaveStatusBatch(ctx context.Context, emunet *EmuNetStatus, pods
 	pipe := c.client.Pipeline()
 
 	key := fmt.Sprintf("emunet:%s:%s", emunet.Namespace, emunet.Name)
-	data, err := json.Marshal(emunet)
+	data, err := json.Marshal(compactEmuNetStatus(emunet))
 	if err != nil {
 		return err
 	}
@@ -92,29 +92,56 @@ func (c *Client) SaveStatusBatch(ctx context.Context, emunet *EmuNetStatus, pods
 		pipe.Set(ctx, summaryKey, summaryData, DefaultTTL)
 	}
 
-	indexKey := fmt.Sprintf("emunet:%s:%s:pods", emunet.Namespace, emunet.Name)
+	indexKey := podIndexKey(emunet.Namespace, emunet.Name)
+	legacyIndexKey := legacyPodIndexKey(emunet.Namespace, emunet.Name)
+	currentPods := make(map[string]struct{}, len(pods))
+	oldPodNames := c.listKnownPodNames(ctx, emunet.Namespace, emunet.Name)
 
-	for _, pod := range pods {
+	for index, pod := range pods {
 		podData, marshalErr := json.Marshal(pod)
 		if marshalErr != nil {
+			continue
+		}
+		if pod.PodName == "" {
 			continue
 		}
 
 		podKey := fmt.Sprintf("emunet:%s:%s:pod:%s", emunet.Namespace, emunet.Name, pod.PodName)
 		pipe.Set(ctx, podKey, podData, DefaultTTL)
+		lookupKey := fmt.Sprintf("pod_lookup:%s", pod.PodName)
+		pipe.Set(ctx, lookupKey, podData, DefaultTTL)
+		pipe.ZAdd(ctx, indexKey, redis.Z{Score: float64(index), Member: pod.PodName})
+		currentPods[pod.PodName] = struct{}{}
+	}
 
-		if pod.PodName != "" {
-			lookupKey := fmt.Sprintf("pod_lookup:%s", pod.PodName)
-			pipe.Set(ctx, lookupKey, podData, DefaultTTL)
+	for _, podName := range oldPodNames {
+		if _, ok := currentPods[podName]; ok {
+			continue
 		}
-
-		pipe.SAdd(ctx, indexKey, pod.PodName)
+		pipe.Del(ctx, fmt.Sprintf("emunet:%s:%s:pod:%s", emunet.Namespace, emunet.Name, podName))
+		pipe.Del(ctx, fmt.Sprintf("pod_lookup:%s", podName))
+		pipe.Del(ctx, fmt.Sprintf("agent:network:%s", podName))
+		pipe.ZRem(ctx, indexKey, podName)
 	}
 
 	pipe.Expire(ctx, indexKey, DefaultTTL)
+	pipe.Del(ctx, legacyIndexKey)
 
 	_, err = pipe.Exec(ctx)
 	return err
+}
+
+func (c *Client) SaveSummary(ctx context.Context, summary *EmuNetSummary) error {
+	if summary == nil {
+		return nil
+	}
+
+	summaryKey := fmt.Sprintf("emunet:%s:%s:summary", summary.Namespace, summary.Name)
+	summaryData, err := json.Marshal(summary)
+	if err != nil {
+		return err
+	}
+	return c.client.Set(ctx, summaryKey, summaryData, DefaultTTL).Err()
 }
 
 func (c *Client) SaveEmuNetStatus(ctx context.Context, status *EmuNetStatus) error {
@@ -158,7 +185,10 @@ func (c *Client) DeleteEmuNetStatus(ctx context.Context, namespace, name string)
 	pipe := c.client.Pipeline()
 
 	indexKey := fmt.Sprintf("emunet:%s:%s:pods", namespace, name)
+	zsetIndexKey := podIndexKey(namespace, name)
 	podNames, _ := c.client.SMembers(ctx, indexKey).Result()
+	zsetPodNames, _ := c.client.ZRange(ctx, zsetIndexKey, 0, -1).Result()
+	podNames = append(podNames, zsetPodNames...)
 
 	for _, podName := range podNames {
 		pipe.Del(ctx, fmt.Sprintf("emunet:%s:%s:pod:%s", namespace, name, podName))
@@ -171,6 +201,7 @@ func (c *Client) DeleteEmuNetStatus(ctx context.Context, namespace, name string)
 	pipe.Del(ctx, mainKey)
 	pipe.Del(ctx, summaryKey)
 	pipe.Del(ctx, indexKey)
+	pipe.Del(ctx, zsetIndexKey)
 
 	_, err := pipe.Exec(ctx)
 	return err
@@ -196,12 +227,37 @@ func (c *Client) ListPodStatuses(ctx context.Context, namespace, name string) ([
 }
 
 func (c *Client) ListPodStatusesPage(ctx context.Context, namespace, name string, offset, limit int) ([]PodStatus, int, error) {
-	indexKey := fmt.Sprintf("emunet:%s:%s:pods", namespace, name)
-	podNames, err := c.client.SMembers(ctx, indexKey).Result()
+	indexKey := podIndexKey(namespace, name)
+	zsetTotal, err := c.client.ZCard(ctx, indexKey).Result()
 	if err != nil {
 		return nil, 0, err
 	}
+	if zsetTotal > 0 {
+		if offset < 0 {
+			offset = 0
+		}
+		if limit <= 0 {
+			limit = int(zsetTotal)
+		}
+		if offset > int(zsetTotal) {
+			offset = int(zsetTotal)
+		}
+		stop := int64(offset + limit - 1)
+		if stop >= zsetTotal {
+			stop = zsetTotal - 1
+		}
+		podNames, err := c.client.ZRange(ctx, indexKey, int64(offset), stop).Result()
+		if err != nil {
+			return nil, 0, err
+		}
+		pods, err := c.getPodStatusesByName(ctx, namespace, name, podNames)
+		return pods, int(zsetTotal), err
+	}
 
+	podNames, err := c.client.SMembers(ctx, legacyPodIndexKey(namespace, name)).Result()
+	if err != nil {
+		return nil, 0, err
+	}
 	if len(podNames) == 0 {
 		return []PodStatus{}, 0, nil
 	}
@@ -223,17 +279,25 @@ func (c *Client) ListPodStatusesPage(ctx context.Context, namespace, name string
 	}
 	podNames = podNames[offset:end]
 
+	pods, err := c.getPodStatusesByName(ctx, namespace, name, podNames)
+	return pods, total, err
+}
+
+func (c *Client) getPodStatusesByName(ctx context.Context, namespace, name string, podNames []string) ([]PodStatus, error) {
+	if len(podNames) == 0 {
+		return []PodStatus{}, nil
+	}
+
 	pipe := c.client.Pipeline()
 	cmds := make([]*redis.StringCmd, len(podNames))
-
 	for i, podName := range podNames {
 		key := fmt.Sprintf("emunet:%s:%s:pod:%s", namespace, name, podName)
 		cmds[i] = pipe.Get(ctx, key)
 	}
 
-	_, err = pipe.Exec(ctx)
+	_, err := pipe.Exec(ctx)
 	if err != nil && err != redis.Nil {
-		return nil, 0, err
+		return nil, err
 	}
 
 	var pods []PodStatus
@@ -247,5 +311,50 @@ func (c *Client) ListPodStatusesPage(ctx context.Context, namespace, name string
 		}
 	}
 
-	return pods, total, nil
+	return pods, nil
+}
+
+func (c *Client) listKnownPodNames(ctx context.Context, namespace, name string) []string {
+	seen := map[string]struct{}{}
+	for _, read := range []func() ([]string, error){
+		func() ([]string, error) { return c.client.ZRange(ctx, podIndexKey(namespace, name), 0, -1).Result() },
+		func() ([]string, error) { return c.client.SMembers(ctx, legacyPodIndexKey(namespace, name)).Result() },
+	} {
+		podNames, err := read()
+		if err != nil {
+			continue
+		}
+		for _, podName := range podNames {
+			seen[podName] = struct{}{}
+		}
+	}
+
+	result := make([]string, 0, len(seen))
+	for podName := range seen {
+		result = append(result, podName)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func compactEmuNetStatus(status *EmuNetStatus) *EmuNetStatus {
+	compact := *status
+	compact.ImageGroupStatus = make([]ImageGroupStatus, 0, len(status.ImageGroupStatus))
+	for _, group := range status.ImageGroupStatus {
+		compact.ImageGroupStatus = append(compact.ImageGroupStatus, ImageGroupStatus{
+			Image:           group.Image,
+			DesiredReplicas: group.DesiredReplicas,
+			ReadyReplicas:   group.ReadyReplicas,
+			PodStatuses:     []PodStatus{},
+		})
+	}
+	return &compact
+}
+
+func podIndexKey(namespace, name string) string {
+	return fmt.Sprintf("emunet:%s:%s:pod_index", namespace, name)
+}
+
+func legacyPodIndexKey(namespace, name string) string {
+	return fmt.Sprintf("emunet:%s:%s:pods", namespace, name)
 }

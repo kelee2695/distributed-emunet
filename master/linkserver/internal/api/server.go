@@ -108,6 +108,13 @@ type PodListResponse struct {
 	Limit  int               `json:"limit"`
 }
 
+type DeleteStatusResponse struct {
+	Namespace     string `json:"namespace"`
+	Name          string `json:"name"`
+	EmuNetExists  bool   `json:"emunetExists"`
+	RemainingPods int    `json:"remainingPods"`
+}
+
 type Response struct {
 	Success bool        `json:"success"`
 	Data    interface{} `json:"data,omitempty"`
@@ -126,14 +133,18 @@ type MasterServer struct {
 	router    *mux.Router
 	logger    *zap.Logger
 	webDir    string
+	pingSem   chan struct{}
 
 	ctx    context.Context
 	cancel context.CancelFunc
 }
 
 // NewMasterServer 初始化
-func NewMasterServer(redisClient *redis.Client, k8sClient client.Client, clientset kubernetes.Interface, restCfg *rest.Config, logger *zap.Logger, webDir string) *MasterServer {
+func NewMasterServer(redisClient *redis.Client, k8sClient client.Client, clientset kubernetes.Interface, restCfg *rest.Config, logger *zap.Logger, webDir string, pingConcurrency int) *MasterServer {
 	ctx, cancel := context.WithCancel(context.Background())
+	if pingConcurrency <= 0 {
+		pingConcurrency = 2
+	}
 
 	s := &MasterServer{
 		redis:     redisClient,
@@ -143,6 +154,7 @@ func NewMasterServer(redisClient *redis.Client, k8sClient client.Client, clients
 		logger:    logger,
 		router:    mux.NewRouter(),
 		webDir:    webDir,
+		pingSem:   make(chan struct{}, pingConcurrency),
 		ctx:       ctx,
 		cancel:    cancel,
 	}
@@ -179,6 +191,7 @@ func (s *MasterServer) setupRoutes() {
 	v1.HandleFunc("/emunets/{namespace}/{name}", s.applyEmuNet).Methods("PUT")
 	v1.HandleFunc("/emunets/{namespace}/{name}", s.deleteEmuNet).Methods("DELETE")
 	v1.HandleFunc("/emunets/{namespace}/{name}/stop", s.deleteEmuNet).Methods("POST")
+	v1.HandleFunc("/emunets/{namespace}/{name}/delete-status", s.getDeleteStatus).Methods("GET")
 	v1.HandleFunc("/emunets/{namespace}/{name}/summary", s.getEmuNetSummary).Methods("GET")
 	v1.HandleFunc("/emunets/{namespace}/{name}/pods", s.listPodsFromCache).Methods("GET")
 
@@ -343,7 +356,17 @@ func (s *MasterServer) handlePingByPods(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	stdout, stderr, err := s.execPing(r.Context(), sourcePod, targetInfo.PodIP, req.Count, req.TimeoutSeconds)
+	if !s.acquirePingSlot(r.Context()) {
+		s.sendError(w, http.StatusTooManyRequests, "too many ping tests are running")
+		return
+	}
+	defer s.releasePingSlot()
+
+	pingTimeout := time.Duration(req.Count*req.TimeoutSeconds+5) * time.Second
+	pingCtx, cancel := context.WithTimeout(r.Context(), pingTimeout)
+	defer cancel()
+
+	stdout, stderr, err := s.execPing(pingCtx, sourcePod, targetInfo.PodIP, req.Count, req.TimeoutSeconds)
 	result := PingResult{
 		SourcePod:      req.Pod1,
 		TargetPod:      req.Pod2,
@@ -359,6 +382,24 @@ func (s *MasterServer) handlePingByPods(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.sendSuccess(w, result)
+}
+
+func (s *MasterServer) acquirePingSlot(ctx context.Context) bool {
+	select {
+	case s.pingSem <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	default:
+		return false
+	}
+}
+
+func (s *MasterServer) releasePingSlot() {
+	select {
+	case <-s.pingSem:
+	default:
+	}
 }
 
 func (s *MasterServer) execPing(ctx context.Context, pod *corev1.Pod, targetIP string, count int, timeoutSeconds int) (string, string, error) {
@@ -550,6 +591,34 @@ func (s *MasterServer) deleteEmuNet(w http.ResponseWriter, r *http.Request) {
 	s.sendSuccess(w, map[string]interface{}{
 		"status":       "stopping",
 		"deletingPods": podCount,
+	})
+}
+
+func (s *MasterServer) getDeleteStatus(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	ns := vars["namespace"]
+	name := vars["name"]
+
+	emunet := &emunetv1.EmuNet{}
+	err := s.k8sClient.Get(r.Context(), types.NamespacedName{Namespace: ns, Name: name}, emunet)
+	if err != nil && !apierrors.IsNotFound(err) {
+		s.logger.Error("failed to get emunet for delete status", zap.Error(err))
+		s.sendError(w, http.StatusInternalServerError, "Failed to get EmuNet")
+		return
+	}
+
+	remaining, countErr := s.countOwnedPods(r.Context(), ns, name)
+	if countErr != nil {
+		s.logger.Error("failed to count pods for delete status", zap.Error(countErr))
+		s.sendError(w, http.StatusInternalServerError, "Failed to count Pods")
+		return
+	}
+
+	s.sendSuccess(w, DeleteStatusResponse{
+		Namespace:     ns,
+		Name:          name,
+		EmuNetExists:  err == nil,
+		RemainingPods: remaining,
 	})
 }
 

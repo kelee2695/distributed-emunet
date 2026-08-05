@@ -124,14 +124,18 @@ spec:
             - --health-probe-bind-address=:8081
             - --metrics-bind-address=:8443
             - --redis-addr=emunet-redis.kube-system:6379
+            - --pod-create-batch-size=100
+            - --pod-delete-batch-size=100
+            - --full-status-sync-seconds=15
+            - --max-concurrent-reconciles=1
           
           resources:
             limits:
-              cpu: 500m
-              memory: 128Mi
+              cpu: "1"
+              memory: 512Mi
             requests:
-              cpu: 10m
-              memory: 64Mi
+              cpu: 100m
+              memory: 128Mi
           livenessProbe:
             httpGet:
               path: /healthz

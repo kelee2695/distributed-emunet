@@ -65,6 +65,10 @@ func main() {
 	var redisAddr string
 	var redisPassword string
 	var redisDB int
+	var podCreateBatchSize int
+	var podDeleteBatchSize int
+	var fullStatusSyncSeconds int
+	var maxConcurrentReconciles int
 	var tlsOpts []func(*tls.Config)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
@@ -75,6 +79,10 @@ func main() {
 	flag.StringVar(&redisAddr, "redis-addr", "localhost:6379", "Redis server address")
 	flag.StringVar(&redisPassword, "redis-password", "", "Redis password")
 	flag.IntVar(&redisDB, "redis-db", 0, "Redis database number")
+	flag.IntVar(&podCreateBatchSize, "pod-create-batch-size", 100, "Maximum pods to create per reconcile loop.")
+	flag.IntVar(&podDeleteBatchSize, "pod-delete-batch-size", 100, "Maximum pods to delete per reconcile loop.")
+	flag.IntVar(&fullStatusSyncSeconds, "full-status-sync-seconds", 15, "Minimum interval between full pod status cache writes.")
+	flag.IntVar(&maxConcurrentReconciles, "max-concurrent-reconciles", 1, "Maximum concurrent EmuNet reconciles.")
 
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
@@ -168,9 +176,13 @@ func main() {
 
 	// [Controller 初始化]
 	if err := (&controller.EmuNetReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Redis:  redisClient,
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		Redis:                   redisClient,
+		PodCreateBatchSize:      podCreateBatchSize,
+		PodDeleteBatchSize:      podDeleteBatchSize,
+		FullStatusSyncPeriod:    time.Duration(fullStatusSyncSeconds) * time.Second,
+		MaxConcurrentReconciles: maxConcurrentReconciles,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "EmuNet")
 		os.Exit(1)

@@ -8,6 +8,7 @@
 - `GET /api/v1/emunets`
 - `POST /api/v1/emunets`
 - `POST /api/v1/emunets/{namespace}/{name}/stop`
+- `GET /api/v1/emunets/{namespace}/{name}/delete-status`
 - `GET /api/v1/emunets/{namespace}/{name}/summary`
 - `GET /api/v1/emunets/{namespace}/{name}/pods?offset=0&limit=100`
 - `POST /api/v1/ebpf/entry/by-pods`
