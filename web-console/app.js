@@ -57,6 +57,7 @@ const el = {
   loadTopologyPods: document.querySelector("#load-topology-pods"),
   previewTopology: document.querySelector("#preview-topology"),
   applyTopology: document.querySelector("#apply-topology"),
+  clearTopologyRules: document.querySelector("#clear-topology-rules"),
   cancelTopology: document.querySelector("#cancel-topology"),
   topologyCanvas: document.querySelector("#topology-canvas"),
   topologyStatus: document.querySelector("#topology-status"),
@@ -77,6 +78,7 @@ let podPage = {
 let topologyPods = [];
 let topologyNodes = [];
 let topologyEdges = [];
+let topologyAppliedEdges = [];
 let topologyCancelled = false;
 
 function init() {
@@ -109,6 +111,7 @@ function init() {
   el.loadTopologyPods.addEventListener("click", loadTopologyPods);
   el.previewTopology.addEventListener("click", previewTopology);
   el.applyTopology.addEventListener("click", applyTopology);
+  el.clearTopologyRules.addEventListener("click", clearTopologyRules);
   el.cancelTopology.addEventListener("click", () => {
     topologyCancelled = true;
     setPill(el.topologyStatus, "停止中", "warn");
@@ -511,6 +514,7 @@ function clearTopology(message) {
   topologyPods = [];
   topologyNodes = [];
   topologyEdges = [];
+  topologyAppliedEdges = [];
   topologyCancelled = true;
   drawTopology();
   setPill(el.topologyStatus, "就绪", "muted");
@@ -702,6 +706,7 @@ async function applyTopology() {
   topologyCancelled = false;
   el.applyTopology.disabled = true;
   setPill(el.topologyStatus, "下发中", "muted");
+  const appliedEdges = [];
   try {
     const result = await runTopologyJobs(topologyEdges, 4, async (edge) => {
       if (topologyCancelled) {
@@ -715,8 +720,10 @@ async function applyTopology() {
           ...edge.params,
         }),
       });
+      appliedEdges.push(edge);
       return true;
     });
+    topologyAppliedEdges = topologyCancelled ? appliedEdges : topologyEdges.slice();
     setPill(el.topologyStatus, topologyCancelled ? "已停止" : "已下发", topologyCancelled ? "warn" : "ok");
     el.topologySummary.textContent = `成功 ${result.success}/${topologyEdges.length} 条，失败 ${result.failed} 条`;
   } catch (err) {
@@ -724,6 +731,51 @@ async function applyTopology() {
     el.topologySummary.textContent = err?.message || String(err);
   } finally {
     el.applyTopology.disabled = false;
+  }
+}
+
+async function clearTopologyRules() {
+  let edges = topologyAppliedEdges.length ? topologyAppliedEdges : topologyEdges;
+  if (!edges.length) {
+    const ready = await previewTopology();
+    if (!ready) {
+      return;
+    }
+    edges = topologyEdges;
+  }
+  if (!edges.length) {
+    setPill(el.topologyStatus, "没有规则", "warn");
+    el.topologySummary.textContent = "当前拓扑没有可清空的链路";
+    return;
+  }
+
+  topologyCancelled = false;
+  el.clearTopologyRules.disabled = true;
+  setPill(el.topologyStatus, "清空中", "muted");
+  try {
+    const result = await runTopologyJobs(edges, 4, async (edge) => {
+      if (topologyCancelled) {
+        return false;
+      }
+      await api("/api/v1/ebpf/entry/by-pods", {
+        method: "DELETE",
+        body: JSON.stringify({
+          pod1: edge.a.pod.podName,
+          pod2: edge.b.pod.podName,
+        }),
+      });
+      return true;
+    });
+    if (!topologyCancelled) {
+      topologyAppliedEdges = [];
+    }
+    setPill(el.topologyStatus, topologyCancelled ? "已停止" : "已清空", topologyCancelled ? "warn" : "ok");
+    el.topologySummary.textContent = `清空 ${result.success}/${edges.length} 条，失败 ${result.failed} 条`;
+  } catch (err) {
+    setPill(el.topologyStatus, shortError(err), "bad");
+    el.topologySummary.textContent = err?.message || String(err);
+  } finally {
+    el.clearTopologyRules.disabled = false;
   }
 }
 
