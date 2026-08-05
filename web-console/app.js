@@ -56,6 +56,8 @@ const el = {
   topologyBandwidth: document.querySelector("#topology-bandwidth"),
   topologyDynamicInterval: document.querySelector("#topology-dynamic-interval"),
   topologyMotionScale: document.querySelector("#topology-motion-scale"),
+  topologyBatchSize: document.querySelector("#topology-batch-size"),
+  topologyBatchConcurrency: document.querySelector("#topology-batch-concurrency"),
   loadTopologyPods: document.querySelector("#load-topology-pods"),
   previewTopology: document.querySelector("#preview-topology"),
   applyTopology: document.querySelector("#apply-topology"),
@@ -729,7 +731,7 @@ async function applyTopology() {
   try {
     const result = await postTopologyBatch(topologyEdges);
     setPill(el.topologyStatus, topologyCancelled ? "已停止" : "已下发", topologyCancelled ? "warn" : "ok");
-    el.topologySummary.textContent = `成功 ${result.success}/${topologyEdges.length} 条，失败 ${result.failed} 条，发布 ${result.publishedCommands} 条 agent 命令`;
+    el.topologySummary.textContent = `成功 ${result.success}/${topologyEdges.length} 条，失败 ${result.failed} 条，${result.batches} 个批次，发布 ${result.publishedCommands} 条 agent 命令`;
   } catch (err) {
     setPill(el.topologyStatus, shortError(err), "bad");
     el.topologySummary.textContent = err?.message || String(err);
@@ -805,7 +807,7 @@ async function runDynamicTopologyTick() {
     const result = await postTopologyBatch(topologyEdges);
     const sample = topologyNodes[0];
     setPill(el.topologyStatus, dynamicTopologyRunning ? "动态运行中" : "已停止", dynamicTopologyRunning ? "ok" : "warn");
-    el.topologySummary.textContent = `第 ${dynamicTopologyTick} 轮：${topologyNodes.length} 节点，${topologyEdges.length} 链路，成功 ${result.success}，失败 ${result.failed}，发布 ${result.publishedCommands} 条命令；样例坐标 ${sample.pod.podName}=(${sample.x.toFixed(3)}, ${sample.y.toFixed(3)})`;
+    el.topologySummary.textContent = `第 ${dynamicTopologyTick} 轮：${topologyNodes.length} 节点，${topologyEdges.length} 链路，${result.batches} 个批次，成功 ${result.success}，失败 ${result.failed}，发布 ${result.publishedCommands} 条命令；样例坐标 ${sample.pod.podName}=(${sample.x.toFixed(3)}, ${sample.y.toFixed(3)})`;
   } catch (err) {
     stopDynamicTopology();
     setPill(el.topologyStatus, shortError(err), "bad");
@@ -832,25 +834,49 @@ function updateDynamicNodePositions(tick) {
 
 async function postTopologyBatch(edges) {
   if (topologyCancelled) {
-    return { success: 0, failed: 0 };
+    return { success: 0, failed: 0, publishedCommands: 0, batches: 0 };
   }
-  const payload = await api("/api/v1/ebpf/entries/by-pods/batch", {
-    method: "POST",
-    body: JSON.stringify({
-      entries: edges.map((edge) => ({
-        pod1: edge.a.pod.podName,
-        pod2: edge.b.pod.podName,
-        ...edge.params,
-      })),
-    }),
-  });
-  const data = payload.data || {};
-  const failed = Number(data.skipped || 0) + Number(data.missing || 0) + Number(data.incomplete || 0);
-  return {
-    success: Math.max(0, edges.length - failed),
-    failed,
-    publishedCommands: Number(data.published || 0),
+  const batchSize = clampInt(numberValue(el.topologyBatchSize) || 500, 10, 5000);
+  const concurrency = clampInt(numberValue(el.topologyBatchConcurrency) || 2, 1, 8);
+  const chunks = chunkArray(edges, batchSize);
+  const result = {
+    success: 0,
+    failed: 0,
+    publishedCommands: 0,
+    batches: chunks.length,
   };
+  let cursor = 0;
+  let completed = 0;
+
+  async function next() {
+    while (cursor < chunks.length && !topologyCancelled) {
+      const index = cursor++;
+      const chunk = chunks[index];
+      const payload = await api("/api/v1/ebpf/entries/by-pods/batch", {
+        method: "POST",
+        body: JSON.stringify({
+          entries: chunk.map((edge) => ({
+            pod1: edge.a.pod.podName,
+            pod2: edge.b.pod.podName,
+            ...edge.params,
+          })),
+        }),
+      });
+      const data = payload.data || {};
+      const failed = Number(data.skipped || 0) + Number(data.missing || 0) + Number(data.incomplete || 0);
+      result.success += Math.max(0, chunk.length - failed);
+      result.failed += failed;
+      result.publishedCommands += Number(data.published || 0);
+      completed++;
+      el.topologySummary.textContent = `批量 ${completed}/${chunks.length}，成功 ${result.success}，失败 ${result.failed}，发布 ${result.publishedCommands} 条命令`;
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, chunks.length) }, next));
+  if (topologyCancelled) {
+    result.failed += edges.length - result.success - result.failed;
+  }
+  return result;
 }
 
 async function clearTopologyRules() {
@@ -921,6 +947,18 @@ function hashText(text) {
 
 function clamp01(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+function clampInt(value, min, max) {
+  return Math.max(min, Math.min(max, Math.floor(value)));
+}
+
+function chunkArray(items, size) {
+  const chunks = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
 }
 
 function renderEmuNetList() {
