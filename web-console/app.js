@@ -281,7 +281,9 @@ async function refreshSummary() {
 
   try {
     const payload = await api(`/api/v1/emunets/${ns}/${name}/summary`);
-    renderSummary(payload.data || {});
+    const summary = payload.data || {};
+    renderSummary(summary);
+    mergeSummaryIntoSelected(summary);
   } catch (err) {
     const selected = findSelectedEmuNet();
     if (selected) {
@@ -317,6 +319,22 @@ function renderSummary(summary) {
   if (summary.desiredReplicas || summary.readyReplicas) {
     el.podSummary.textContent = `${summary.readyReplicas || 0}/${summary.desiredReplicas || 0} Ready, ${summary.macSyncedReplicas || 0} MAC synced`;
   }
+}
+
+function mergeSummaryIntoSelected(summary) {
+  if (!summary?.name || !summary?.namespace) {
+    return;
+  }
+  const selected = emunets.find((item) => item.namespace === summary.namespace && item.name === summary.name);
+  if (!selected) {
+    return;
+  }
+  selected.readyReplicas = Number(summary.readyReplicas || 0);
+  selected.desiredReplicas = Number(summary.desiredReplicas || 0);
+  selected.totalReplicas = Number(summary.desiredReplicas || selected.totalReplicas || 0);
+  selected.observedGen = Number(summary.observedGen || selected.observedGen || 0);
+  renderEmuNetList();
+  updateSelectedStatus();
 }
 
 function clearPodDetails(message) {
