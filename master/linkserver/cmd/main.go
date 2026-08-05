@@ -13,7 +13,13 @@ import (
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	emunetv1 "github.com/emunet/emunet-operator/master/controller/api/v1"
 	"github.com/emunet/emunet-operator/master/linkserver/internal/api"
 	"github.com/emunet/emunet-operator/pkg/redis"
 )
@@ -24,10 +30,12 @@ func main() {
 	var redisPassword string
 	var redisDB int
 	var devMode bool
+	var webDir string
 
 	// 基础配置
 	flag.StringVar(&apiAddr, "api-bind-address", ":8082", "The address the REST API endpoint binds to.")
 	flag.BoolVar(&devMode, "dev", true, "Enable development mode logging")
+	flag.StringVar(&webDir, "web-dir", "web-console", "Static web console directory. Set empty to disable.")
 
 	// Redis 配置
 	flag.StringVar(&redisAddr, "redis-addr", "localhost:6379", "Redis server address")
@@ -60,11 +68,20 @@ func main() {
 	cancel()
 	sugar.Infow("successfully connected to Redis", "address", redisAddr)
 
-	// 3. 初始化业务逻辑 (不再传递 k8sClient)
-	// 注意：你需要同步修改 internal/api/server.go 中的 NewMasterServer 签名
-	apiHandler := api.NewMasterServer(redisClient, logger)
+	// 3. 初始化 Kubernetes Client
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(emunetv1.AddToScheme(scheme))
 
-	// 4. 启动 HTTP Server
+	k8sClient, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+	if err != nil {
+		sugar.Fatalw("failed to initialize Kubernetes client", "error", err)
+	}
+
+	// 4. 初始化业务逻辑
+	apiHandler := api.NewMasterServer(redisClient, k8sClient, logger, webDir)
+
+	// 5. 启动 HTTP Server
 	server := &http.Server{
 		Addr:         apiAddr,
 		Handler:      apiHandler.GetRouter(),

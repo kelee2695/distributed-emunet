@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>EmuNet Console</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar" aria-label="连接">
+        <div>
+          <p class="eyebrow">EmuNet Console</p>
+          <h1>Pod 与链路控制台</h1>
+        </div>
+        <div class="connection">
+          <label>
+            <span>LinkServer</span>
+            <input id="linkserver-url" type="url" spellcheck="false" value="http://localhost:8082" />
+          </label>
+          <button id="save-config" class="primary">保存</button>
+          <button id="check-health">检测</button>
+          <span id="health-pill" class="pill muted">未检测</span>
+        </div>
+      </section>
+
+      <section class="grid">
+        <div class="panel control-panel">
+          <div class="panel-head">
+            <div>
+              <h2>Pod 启停</h2>
+              <p id="emunet-status">创建或更新 EmuNet 实例</p>
+            </div>
+            <button id="refresh-emunets">刷新实例</button>
+          </div>
+
+          <div class="inline-form">
+            <label>
+              <span>Namespace</span>
+              <input id="namespace" value="default" />
+            </label>
+            <label>
+              <span>Name</span>
+              <input id="emunet-name" value="emunet-example" />
+            </label>
+          </div>
+
+          <div id="image-groups" class="image-groups"></div>
+
+          <div class="actions">
+            <button id="add-group">增加镜像组</button>
+            <button id="start-emunet" class="primary">启动/更新 Pod</button>
+            <button id="stop-emunet" class="danger">关闭 Pod</button>
+          </div>
+
+          <div class="instance-list-wrap">
+            <h3>实例列表</h3>
+            <div id="emunet-list" class="instance-list">
+              <div class="empty block">暂无实例</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel rule-panel">
+          <div class="panel-head">
+            <div>
+              <h2>链路规则</h2>
+              <p>通过 Pod 名称下发双向 eBPF 规则</p>
+            </div>
+            <span id="rule-status" class="pill muted">就绪</span>
+          </div>
+          <div class="rule-form">
+            <label>
+              <span>Pod 1</span>
+              <select id="pod1"></select>
+            </label>
+            <label>
+              <span>Pod 2</span>
+              <select id="pod2"></select>
+            </label>
+            <label>
+              <span>带宽 bps</span>
+              <input id="throttle" type="number" min="0" step="1" value="0" />
+            </label>
+            <label>
+              <span>延迟 0.01ms</span>
+              <input id="delay" type="number" min="0" step="1" value="1000" />
+            </label>
+            <label>
+              <span>丢包 0.01%</span>
+              <input id="loss" type="number" min="0" max="10000" step="1" value="0" />
+            </label>
+            <label>
+              <span>抖动 0.01ms</span>
+              <input id="jitter" type="number" min="0" step="1" value="0" />
+            </label>
+          </div>
+          <div class="actions">
+            <button id="apply-rule" class="primary">应用规则</button>
+            <button id="delete-rule" class="danger">删除规则</button>
+          </div>
+        </div>
+
+        <div class="panel monitor-panel">
+          <div class="panel-head">
+            <div>
+              <h2>Pod 监控</h2>
+              <p id="pod-summary">等待加载 Pod 状态</p>
+            </div>
+            <div class="monitor-actions">
+              <label class="check-row">
+                <input id="auto-refresh" type="checkbox" checked />
+                <span>自动刷新</span>
+              </label>
+              <button id="refresh-pods">刷新</button>
+            </div>
+          </div>
+          <div class="metric-row">
+            <div>
+              <span>Desired</span>
+              <strong id="metric-desired">0</strong>
+            </div>
+            <div>
+              <span>Ready</span>
+              <strong id="metric-ready">0</strong>
+            </div>
+            <div>
+              <span>MAC</span>
+              <strong id="metric-mac">0</strong>
+            </div>
+            <div>
+              <span>Nodes</span>
+              <strong id="metric-nodes">0</strong>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Pod</th>
+                  <th>Phase</th>
+                  <th>Node</th>
+                  <th>IP</th>
+                  <th>MAC</th>
+                  <th>ifindex</th>
+                </tr>
+              </thead>
+              <tbody id="pod-table">
+                <tr>
+                  <td colspan="6" class="empty">暂无数据</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

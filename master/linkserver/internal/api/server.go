@@ -9,7 +9,12 @@ import (
 
 	"github.com/gorilla/mux"
 	"go.uber.org/zap"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	emunetv1 "github.com/emunet/emunet-operator/master/controller/api/v1"
 	"github.com/emunet/emunet-operator/pkg/redis"
 )
 
@@ -36,6 +41,29 @@ type EBPFEntryDeleteByPodsRequest struct {
 	Pod2 string `json:"pod2"`
 }
 
+type EmuNetApplyRequest struct {
+	Namespace     string             `json:"namespace"`
+	Name          string             `json:"name"`
+	TotalReplicas int32              `json:"totalReplicas"`
+	ImageGroups   []EmuNetImageGroup `json:"imageGroups"`
+	Selector      map[string]string  `json:"selector,omitempty"`
+}
+
+type EmuNetImageGroup struct {
+	Image    string `json:"image"`
+	Replicas int32  `json:"replicas"`
+}
+
+type EmuNetSummary struct {
+	Namespace       string             `json:"namespace"`
+	Name            string             `json:"name"`
+	TotalReplicas   int32              `json:"totalReplicas"`
+	ReadyReplicas   int32              `json:"readyReplicas"`
+	DesiredReplicas int32              `json:"desiredReplicas"`
+	ImageGroups     []EmuNetImageGroup `json:"imageGroups"`
+	ObservedGen     int64              `json:"observedGen"`
+}
+
 type Response struct {
 	Success bool        `json:"success"`
 	Data    interface{} `json:"data,omitempty"`
@@ -47,24 +75,28 @@ type Response struct {
 // =================================================================================
 
 type MasterServer struct {
-	redis  *redis.Client
-	router *mux.Router
-	logger *zap.Logger
+	redis     *redis.Client
+	k8sClient client.Client
+	router    *mux.Router
+	logger    *zap.Logger
+	webDir    string
 
 	ctx    context.Context
 	cancel context.CancelFunc
 }
 
 // NewMasterServer 初始化
-func NewMasterServer(redisClient *redis.Client, logger *zap.Logger) *MasterServer {
+func NewMasterServer(redisClient *redis.Client, k8sClient client.Client, logger *zap.Logger, webDir string) *MasterServer {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &MasterServer{
-		redis:  redisClient,
-		logger: logger,
-		router: mux.NewRouter(),
-		ctx:    ctx,
-		cancel: cancel,
+		redis:     redisClient,
+		k8sClient: k8sClient,
+		logger:    logger,
+		router:    mux.NewRouter(),
+		webDir:    webDir,
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 
 	s.setupRoutes()
@@ -91,9 +123,17 @@ func (s *MasterServer) setupRoutes() {
 	v1.HandleFunc("/ebpf/entry/by-pods", s.handleRuleCreate).Methods("POST")
 	v1.HandleFunc("/ebpf/entry/by-pods", s.handleRuleDelete).Methods("DELETE")
 
+	v1.HandleFunc("/emunets", s.listEmuNets).Methods("GET")
+	v1.HandleFunc("/emunets", s.applyEmuNet).Methods("POST")
+	v1.HandleFunc("/emunets/{namespace}/{name}", s.getEmuNet).Methods("GET")
+	v1.HandleFunc("/emunets/{namespace}/{name}", s.applyEmuNet).Methods("PUT")
+	v1.HandleFunc("/emunets/{namespace}/{name}", s.deleteEmuNet).Methods("DELETE")
+	v1.HandleFunc("/emunets/{namespace}/{name}/stop", s.deleteEmuNet).Methods("POST")
 	v1.HandleFunc("/emunets/{namespace}/{name}/pods", s.listPodsFromCache).Methods("GET")
 
-	v1.HandleFunc("/emunets", s.notImplemented).Methods("GET")
+	if s.webDir != "" {
+		s.router.PathPrefix("/").Handler(http.FileServer(http.Dir(s.webDir)))
+	}
 }
 
 // =================================================================================
@@ -199,6 +239,132 @@ func (s *MasterServer) handleRuleDelete(w http.ResponseWriter, r *http.Request) 
 // 5. Group C: 查询平面 Handlers (只读操作)
 // =================================================================================
 
+func (s *MasterServer) listEmuNets(w http.ResponseWriter, r *http.Request) {
+	list := &emunetv1.EmuNetList{}
+	if err := s.k8sClient.List(r.Context(), list); err != nil {
+		s.logger.Error("failed to list emunets", zap.Error(err))
+		s.sendError(w, http.StatusInternalServerError, "Failed to list EmuNet resources")
+		return
+	}
+
+	items := make([]EmuNetSummary, 0, len(list.Items))
+	for _, item := range list.Items {
+		items = append(items, summarizeEmuNet(&item))
+	}
+
+	s.sendSuccess(w, items)
+}
+
+func (s *MasterServer) getEmuNet(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	emunet := &emunetv1.EmuNet{}
+	if err := s.k8sClient.Get(r.Context(), types.NamespacedName{
+		Namespace: vars["namespace"],
+		Name:      vars["name"],
+	}, emunet); err != nil {
+		if apierrors.IsNotFound(err) {
+			s.sendError(w, http.StatusNotFound, "EmuNet not found")
+			return
+		}
+		s.logger.Error("failed to get emunet", zap.Error(err))
+		s.sendError(w, http.StatusInternalServerError, "Failed to get EmuNet")
+		return
+	}
+	s.sendSuccess(w, emunet)
+}
+
+func (s *MasterServer) applyEmuNet(w http.ResponseWriter, r *http.Request) {
+	var req EmuNetApplyRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		s.sendError(w, http.StatusBadRequest, "Invalid JSON: "+err.Error())
+		return
+	}
+
+	vars := mux.Vars(r)
+	if vars["namespace"] != "" {
+		req.Namespace = vars["namespace"]
+	}
+	if vars["name"] != "" {
+		req.Name = vars["name"]
+	}
+	if err := normalizeEmuNetRequest(&req); err != nil {
+		s.sendError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	nn := types.NamespacedName{Namespace: req.Namespace, Name: req.Name}
+	existing := &emunetv1.EmuNet{}
+	err := s.k8sClient.Get(r.Context(), nn, existing)
+	if err != nil && !apierrors.IsNotFound(err) {
+		s.logger.Error("failed to check emunet", zap.Error(err))
+		s.sendError(w, http.StatusInternalServerError, "Failed to check EmuNet")
+		return
+	}
+
+	spec := emunetv1.EmuNetSpec{
+		TotalReplicas: req.TotalReplicas,
+		ImageGroups:   convertImageGroups(req.ImageGroups),
+	}
+	if len(req.Selector) > 0 {
+		spec.Selector = &metav1.LabelSelector{MatchLabels: req.Selector}
+	}
+
+	if apierrors.IsNotFound(err) {
+		emunet := &emunetv1.EmuNet{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "emunet.emunet.io/v1",
+				Kind:       "EmuNet",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: req.Namespace,
+				Name:      req.Name,
+			},
+			Spec: spec,
+		}
+		if err := s.k8sClient.Create(r.Context(), emunet); err != nil {
+			s.logger.Error("failed to create emunet", zap.Error(err))
+			s.sendError(w, http.StatusInternalServerError, "Failed to create EmuNet")
+			return
+		}
+		s.sendSuccess(w, map[string]string{"status": "created"})
+		return
+	}
+
+	existing.Spec = spec
+	if err := s.k8sClient.Update(r.Context(), existing); err != nil {
+		s.logger.Error("failed to update emunet", zap.Error(err))
+		s.sendError(w, http.StatusInternalServerError, "Failed to update EmuNet")
+		return
+	}
+	s.sendSuccess(w, map[string]string{"status": "updated"})
+}
+
+func (s *MasterServer) deleteEmuNet(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	emunet := &emunetv1.EmuNet{}
+	err := s.k8sClient.Get(r.Context(), types.NamespacedName{
+		Namespace: vars["namespace"],
+		Name:      vars["name"],
+	}, emunet)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			s.sendSuccess(w, map[string]string{"status": "already stopped"})
+			return
+		}
+		s.logger.Error("failed to get emunet for delete", zap.Error(err))
+		s.sendError(w, http.StatusInternalServerError, "Failed to get EmuNet")
+		return
+	}
+	if err := s.k8sClient.Delete(r.Context(), emunet); err != nil && !apierrors.IsNotFound(err) {
+		s.logger.Error("failed to delete emunet", zap.Error(err))
+		s.sendError(w, http.StatusInternalServerError, "Failed to stop EmuNet")
+		return
+	}
+	s.sendSuccess(w, map[string]string{"status": "stopping"})
+}
+
 func (s *MasterServer) listPodsFromCache(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	ns := vars["namespace"]
@@ -223,8 +389,68 @@ func (s *MasterServer) healthCheck(w http.ResponseWriter, r *http.Request) {
 	s.sendSuccess(w, map[string]string{"status": "healthy"})
 }
 
-func (s *MasterServer) notImplemented(w http.ResponseWriter, r *http.Request) {
-	s.sendError(w, http.StatusNotImplemented, "API endpoint not implemented or deprecated")
+func normalizeEmuNetRequest(req *EmuNetApplyRequest) error {
+	if req.Namespace == "" {
+		req.Namespace = "default"
+	}
+	if req.Name == "" {
+		return fmt.Errorf("name is required")
+	}
+	if len(req.ImageGroups) == 0 {
+		return fmt.Errorf("at least one image group is required")
+	}
+
+	var total int32
+	for _, group := range req.ImageGroups {
+		if group.Image == "" {
+			return fmt.Errorf("image is required for every image group")
+		}
+		if group.Replicas < 0 {
+			return fmt.Errorf("replicas cannot be negative")
+		}
+		total += group.Replicas
+	}
+	if req.TotalReplicas == 0 {
+		req.TotalReplicas = total
+	}
+	if req.TotalReplicas != total {
+		return fmt.Errorf("totalReplicas must equal the sum of image group replicas")
+	}
+	return nil
+}
+
+func convertImageGroups(groups []EmuNetImageGroup) []emunetv1.ImageGroup {
+	result := make([]emunetv1.ImageGroup, 0, len(groups))
+	for _, group := range groups {
+		result = append(result, emunetv1.ImageGroup{
+			Image:    group.Image,
+			Replicas: group.Replicas,
+		})
+	}
+	return result
+}
+
+func summarizeEmuNet(em *emunetv1.EmuNet) EmuNetSummary {
+	return EmuNetSummary{
+		Namespace:       em.Namespace,
+		Name:            em.Name,
+		TotalReplicas:   em.Spec.TotalReplicas,
+		ReadyReplicas:   em.Status.ReadyReplicas,
+		DesiredReplicas: em.Status.DesiredReplicas,
+		ImageGroups:     summarizeImageGroups(em.Spec.ImageGroups),
+		ObservedGen:     em.Status.ObservedGen,
+	}
+}
+
+func summarizeImageGroups(groups []emunetv1.ImageGroup) []EmuNetImageGroup {
+	result := make([]EmuNetImageGroup, 0, len(groups))
+	for _, group := range groups {
+		result = append(result, EmuNetImageGroup{
+			Image:    group.Image,
+			Replicas: group.Replicas,
+		})
+	}
+	return result
 }
 
 // =================================================================================

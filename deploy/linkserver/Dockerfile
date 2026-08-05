@@ -17,5 +17,6 @@ WORKDIR /
 RUN apk add --no-cache ca-certificates
 
 COPY --from=builder /workspace/bin/linkserver /linkserver
+COPY web-console /web-console
 
 RUN chmod +x /linkserver
