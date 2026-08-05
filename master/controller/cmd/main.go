@@ -65,6 +65,8 @@ func main() {
 	var redisAddr string
 	var redisPassword string
 	var redisDB int
+	var redisPoolSize int
+	var redisMinIdleConns int
 	var podCreateBatchSize int
 	var podDeleteBatchSize int
 	var fullStatusSyncSeconds int
@@ -79,6 +81,8 @@ func main() {
 	flag.StringVar(&redisAddr, "redis-addr", "localhost:6379", "Redis server address")
 	flag.StringVar(&redisPassword, "redis-password", "", "Redis password")
 	flag.IntVar(&redisDB, "redis-db", 0, "Redis database number")
+	flag.IntVar(&redisPoolSize, "redis-pool-size", 50, "Redis connection pool size")
+	flag.IntVar(&redisMinIdleConns, "redis-min-idle-conns", 5, "Redis minimum idle connections")
 	flag.IntVar(&podCreateBatchSize, "pod-create-batch-size", 100, "Maximum pods to create per reconcile loop.")
 	flag.IntVar(&podDeleteBatchSize, "pod-delete-batch-size", 100, "Maximum pods to delete per reconcile loop.")
 	flag.IntVar(&fullStatusSyncSeconds, "full-status-sync-seconds", 15, "Minimum interval between full pod status cache writes.")
@@ -165,7 +169,10 @@ func main() {
 	}
 
 	// [Redis 初始化]
-	redisClient := redis.NewClient(redisAddr, redisPassword, redisDB)
+	redisClient := redis.NewClientWithOptions(redisAddr, redisPassword, redisDB, redis.ClientOptions{
+		PoolSize:     redisPoolSize,
+		MinIdleConns: redisMinIdleConns,
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := redisClient.Ping(ctx); err != nil {
 		setupLog.Error(err, "failed to connect to Redis")

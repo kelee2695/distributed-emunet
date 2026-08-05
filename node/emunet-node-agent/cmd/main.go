@@ -25,12 +25,22 @@ func main() {
 	var redisPassword string
 	var redisDB int
 	var nodeName string
+	var redisPoolSize int
+	var redisMinIdleConns int
+	var maxConcurrent int
+	var podInfoWorkers int
+	var podInfoQueueSize int
 
 	flag.StringVar(&apiAddr, "api-bind-address", ":12345", "The address the Agent API endpoint binds to.")
 	flag.StringVar(&redisAddr, "redis-addr", "emunet-redis.default.svc.cluster.local:6379", "The address of the Redis server")
 	flag.StringVar(&redisPassword, "redis-password", "", "The password of the Redis server")
 	flag.IntVar(&redisDB, "redis-db", 0, "The Redis database index")
 	flag.StringVar(&nodeName, "node-name", "", "The name of the node this agent is running on")
+	flag.IntVar(&redisPoolSize, "redis-pool-size", 20, "Redis connection pool size")
+	flag.IntVar(&redisMinIdleConns, "redis-min-idle-conns", 2, "Redis minimum idle connections")
+	flag.IntVar(&maxConcurrent, "max-concurrent", 64, "Maximum concurrent eBPF HTTP requests")
+	flag.IntVar(&podInfoWorkers, "podinfo-workers", 4, "Workers used to write Pod network info to Redis")
+	flag.IntVar(&podInfoQueueSize, "podinfo-queue-size", 2048, "Queue size for Pod network info Redis writes")
 
 	flag.Parse()
 
@@ -52,7 +62,10 @@ func main() {
 	}
 
 	logger.Infow("Connecting to Redis", "addr", redisAddr)
-	redisClient := redis.NewClient(redisAddr, redisPassword, redisDB)
+	redisClient := redis.NewClientWithOptions(redisAddr, redisPassword, redisDB, redis.ClientOptions{
+		PoolSize:     redisPoolSize,
+		MinIdleConns: redisMinIdleConns,
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := redisClient.Ping(ctx); err != nil {
@@ -62,7 +75,7 @@ func main() {
 	cancel()
 	logger.Info("Connected to Redis successfully")
 
-	agentServer := api.NewServer(redisClient)
+	agentServer := api.NewServer(redisClient, maxConcurrent, podInfoWorkers, podInfoQueueSize)
 
 	consumer := redis.NewControlBusConsumer(
 		redisClient.GetClient(),

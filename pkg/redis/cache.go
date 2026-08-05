@@ -73,6 +73,11 @@ func (c *Client) GetAgentNetworkInfoBatch(ctx context.Context, podNames []string
 	return result, nil
 }
 
+type ScoredPodStatus struct {
+	Pod   PodStatus
+	Score float64
+}
+
 func (c *Client) SaveStatusBatch(ctx context.Context, emunet *EmuNetStatus, pods []PodStatus, summary *EmuNetSummary) error {
 	pipe := c.client.Pipeline()
 
@@ -131,6 +136,48 @@ func (c *Client) SaveStatusBatch(ctx context.Context, emunet *EmuNetStatus, pods
 	return err
 }
 
+func (c *Client) SaveStatusDelta(ctx context.Context, emunet *EmuNetStatus, pods []ScoredPodStatus, summary *EmuNetSummary) error {
+	pipe := c.client.Pipeline()
+
+	key := fmt.Sprintf("emunet:%s:%s", emunet.Namespace, emunet.Name)
+	data, err := json.Marshal(compactEmuNetStatus(emunet))
+	if err != nil {
+		return err
+	}
+	pipe.Set(ctx, key, data, DefaultTTL)
+
+	if summary != nil {
+		summaryKey := fmt.Sprintf("emunet:%s:%s:summary", emunet.Namespace, emunet.Name)
+		summaryData, err := json.Marshal(summary)
+		if err != nil {
+			return err
+		}
+		pipe.Set(ctx, summaryKey, summaryData, DefaultTTL)
+	}
+
+	indexKey := podIndexKey(emunet.Namespace, emunet.Name)
+	for _, item := range pods {
+		pod := item.Pod
+		if pod.PodName == "" {
+			continue
+		}
+		podData, marshalErr := json.Marshal(pod)
+		if marshalErr != nil {
+			continue
+		}
+
+		podKey := fmt.Sprintf("emunet:%s:%s:pod:%s", emunet.Namespace, emunet.Name, pod.PodName)
+		pipe.Set(ctx, podKey, podData, DefaultTTL)
+		pipe.Set(ctx, fmt.Sprintf("pod_lookup:%s", pod.PodName), podData, DefaultTTL)
+		pipe.ZAdd(ctx, indexKey, redis.Z{Score: item.Score, Member: pod.PodName})
+	}
+	pipe.Expire(ctx, indexKey, DefaultTTL)
+	pipe.Del(ctx, legacyPodIndexKey(emunet.Namespace, emunet.Name))
+
+	_, err = pipe.Exec(ctx)
+	return err
+}
+
 func (c *Client) SaveSummary(ctx context.Context, summary *EmuNetSummary) error {
 	if summary == nil {
 		return nil
@@ -142,6 +189,26 @@ func (c *Client) SaveSummary(ctx context.Context, summary *EmuNetSummary) error 
 		return err
 	}
 	return c.client.Set(ctx, summaryKey, summaryData, DefaultTTL).Err()
+}
+
+func (c *Client) DeletePodStatuses(ctx context.Context, namespace, name string, podNames []string) error {
+	if len(podNames) == 0 {
+		return nil
+	}
+
+	pipe := c.client.Pipeline()
+	indexKey := podIndexKey(namespace, name)
+	for _, podName := range podNames {
+		if podName == "" {
+			continue
+		}
+		pipe.Del(ctx, fmt.Sprintf("emunet:%s:%s:pod:%s", namespace, name, podName))
+		pipe.Del(ctx, fmt.Sprintf("pod_lookup:%s", podName))
+		pipe.Del(ctx, fmt.Sprintf("agent:network:%s", podName))
+		pipe.ZRem(ctx, indexKey, podName)
+	}
+	_, err := pipe.Exec(ctx)
+	return err
 }
 
 func (c *Client) SaveEmuNetStatus(ctx context.Context, status *EmuNetStatus) error {

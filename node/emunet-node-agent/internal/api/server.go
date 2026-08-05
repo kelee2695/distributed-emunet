@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -61,6 +60,7 @@ type AgentServer struct {
 	ebpfMapMutex   sync.RWMutex
 	ebpfMapLoaded  bool
 	ebpfMapLoadErr error
+	podInfoQueue   chan PodInfo
 }
 
 type ServerMetrics struct {
@@ -72,16 +72,27 @@ type ServerMetrics struct {
 }
 
 // NewServer 初始化
-func NewServer(redisClient *redis.Client) *AgentServer {
+func NewServer(redisClient *redis.Client, maxConcurrent int, podInfoWorkers int, podInfoQueueSize int) *AgentServer {
+	if maxConcurrent <= 0 {
+		maxConcurrent = 64
+	}
+	if podInfoWorkers <= 0 {
+		podInfoWorkers = 4
+	}
+	if podInfoQueueSize <= 0 {
+		podInfoQueueSize = 2048
+	}
+
 	s := &AgentServer{
 		router:       mux.NewRouter(),
 		podInfoStore: &PodInfoStore{}, // 初始化本地 Store
 		redis:        redisClient,
-		// 并发控制：根据机器核数调整，例如 2000
-		semaphore: make(chan struct{}, 2000),
-		metrics:   &ServerMetrics{},
+		semaphore:    make(chan struct{}, maxConcurrent),
+		metrics:      &ServerMetrics{},
+		podInfoQueue: make(chan PodInfo, podInfoQueueSize),
 	}
 	s.setupRoutes()
+	s.startPodInfoWorkers(podInfoWorkers)
 	return s
 }
 
@@ -218,26 +229,41 @@ func (s *AgentServer) handlePodInfoAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	s.podInfoStore.Set(req.PodName, info)
 
-	// 2. 异步写入 Redis (增加调试日志!!!)
-	go func(name, mac string, idx int) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		// --- 修改开始 ---
-		err := s.redis.UpdatePodNetworkInfo(ctx, name, mac, idx)
-		if err != nil {
-			// 这里会打印具体的错误原因，例如 DNS 解析失败、连接超时等
-			fmt.Printf("[ERROR] Failed to update Redis for pod %s: %v\n", name, err)
-		} else {
-			fmt.Printf("[DEBUG] Successfully wrote to Redis: lookup:%s -> %s\n", name, mac)
-		}
-		// --- 修改结束 ---
-
-	}(req.PodName, req.SrcMac, req.Ifindex)
+	select {
+	case s.podInfoQueue <- *info:
+	case <-time.After(100 * time.Millisecond):
+		s.recordRequestEnd(false, true)
+		http.Error(w, "pod info queue full", http.StatusServiceUnavailable)
+		return
+	}
 
 	s.recordRequestEnd(true, false)
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"status":"success"}`))
+}
+
+func (s *AgentServer) startPodInfoWorkers(workerCount int) {
+	for i := 0; i < workerCount; i++ {
+		go func() {
+			for info := range s.podInfoQueue {
+				s.writePodInfoWithRetry(info)
+			}
+		}()
+	}
+}
+
+func (s *AgentServer) writePodInfoWithRetry(info PodInfo) {
+	backoff := 100 * time.Millisecond
+	for attempt := 0; attempt < 3; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err := s.redis.UpdatePodNetworkInfo(ctx, info.PodName, info.SrcMac, info.Ifindex)
+		cancel()
+		if err == nil {
+			return
+		}
+		time.Sleep(backoff)
+		backoff *= 2
+	}
 }
 
 func (s *AgentServer) handlePodInfo(w http.ResponseWriter, r *http.Request) {

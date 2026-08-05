@@ -42,7 +42,14 @@ spec:
         image: 100.75.179.29:5000/emunet-node-agent:latest
         imagePullPolicy: Always
         command: ["/node-agent"]
-        args: ["-redis-addr=emunet-redis.kube-system:6379", "-node-name=$(MY_NODE_NAME)"]
+        args:
+        - -redis-addr=emunet-redis.kube-system:6379
+        - -node-name=$(MY_NODE_NAME)
+        - -redis-pool-size=20
+        - -redis-min-idle-conns=2
+        - -max-concurrent=64
+        - -podinfo-workers=4
+        - -podinfo-queue-size=2048
         env:
         - name: MY_NODE_NAME
           valueFrom:
@@ -54,6 +61,27 @@ spec:
           protocol: TCP
         securityContext:
           privileged: true
+        resources:
+          limits:
+            cpu: 500m
+            memory: 256Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 12345
+          initialDelaySeconds: 10
+          periodSeconds: 20
+          timeoutSeconds: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 12345
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
         volumeMounts:
         - name: bpf-fs
           mountPath: /sys/fs/bpf

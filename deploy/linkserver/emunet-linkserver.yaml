@@ -100,6 +100,8 @@ spec:
             - --api-bind-address=:8082
             # 【注意】Redis 地址
             - --redis-addr=emunet-redis.kube-system:6379
+            - --redis-pool-size=50
+            - --redis-min-idle-conns=5
             - --ping-concurrency=2
           
           ports:

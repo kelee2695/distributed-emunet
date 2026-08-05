@@ -124,6 +124,8 @@ spec:
             - --health-probe-bind-address=:8081
             - --metrics-bind-address=:8443
             - --redis-addr=emunet-redis.kube-system:6379
+            - --redis-pool-size=50
+            - --redis-min-idle-conns=5
             - --pod-create-batch-size=100
             - --pod-delete-batch-size=100
             - --full-status-sync-seconds=15

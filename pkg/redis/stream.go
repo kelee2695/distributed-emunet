@@ -11,7 +11,8 @@ import (
 )
 
 const (
-	CommandTTL = 5 * time.Minute
+	CommandTTL          = 5 * time.Minute
+	CommandStreamMaxLen = 10000
 )
 
 func (c *Client) PublishEBPFCommand(ctx context.Context, targetNode, commandType string, payload *EBPFCommandPayload) error {
@@ -45,6 +46,8 @@ func (c *Client) PublishCommand(ctx context.Context, command *ControlCommand) er
 
 	_, err := c.client.XAdd(ctx, &redis.XAddArgs{
 		Stream: streamKey,
+		MaxLen: CommandStreamMaxLen,
+		Approx: true,
 		Values: values,
 	}).Result()
 
@@ -104,14 +107,11 @@ func (c *ControlBusConsumer) createConsumerGroup() error {
 }
 
 func (c *ControlBusConsumer) consumeLoop() {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
-		case <-ticker.C:
+		default:
 			c.consumeMessages()
 		}
 	}
@@ -122,11 +122,14 @@ func (c *ControlBusConsumer) consumeMessages() {
 		Group:    c.consumerGroup,
 		Consumer: c.consumerID,
 		Streams:  []string{c.streamKey, ">"},
-		Count:    10,
-		Block:    0,
+		Count:    100,
+		Block:    5 * time.Second,
 	}).Result()
 
 	if err != nil {
+		if err != redis.Nil {
+			time.Sleep(200 * time.Millisecond)
+		}
 		return
 	}
 
@@ -174,5 +177,6 @@ func (c *ControlBusConsumer) processMessage(message redis.XMessage) bool {
 func (c *ControlBusConsumer) ackMessages(messageIDs []string) {
 	if len(messageIDs) > 0 {
 		c.client.XAck(c.ctx, c.streamKey, c.consumerGroup, messageIDs...)
+		c.client.XDel(c.ctx, c.streamKey, messageIDs...)
 	}
 }

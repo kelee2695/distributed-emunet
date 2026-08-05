@@ -34,6 +34,7 @@ type EmuNetReconciler struct {
 	statusWriteMu            sync.Mutex
 	lastFullStatusWrite      map[string]time.Time
 	lastFullStatusGeneration map[string]int64
+	lastPodFingerprint       map[string]map[string]string
 }
 
 const (
@@ -50,13 +51,14 @@ const (
 )
 
 type podSyncResult struct {
-	Created  int
-	Updated  int
-	Deleted  int
-	Requeue  bool
-	Existing int
-	Desired  int
-	PodMap   map[string]*corev1.Pod
+	Created      int
+	Updated      int
+	Deleted      int
+	Requeue      bool
+	Existing     int
+	Desired      int
+	PodMap       map[string]*corev1.Pod
+	DeletedNames []string
 }
 
 // Reconcile is the main loop
@@ -173,6 +175,7 @@ func (r *EmuNetReconciler) syncPods(ctx context.Context, emunet *emunetv1.EmuNet
 				return result, err
 			}
 			result.Deleted++
+			result.DeletedNames = append(result.DeletedNames, podName)
 		}
 	}
 
@@ -222,8 +225,7 @@ func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.Em
 		LastUpdated:      time.Now(),
 	}
 
-	forceFullStatusWrite := syncResult.Created > 0 || syncResult.Updated > 0 || syncResult.Deleted > 0
-	if err := r.saveStatusToRedis(ctx, emunet, redisStatus, summary, forceFullStatusWrite); err != nil {
+	if err := r.saveStatusToRedis(ctx, emunet, redisStatus, summary, syncResult.DeletedNames); err != nil {
 		logger.Error(err, "failed to update redis cache")
 	}
 
@@ -232,21 +234,37 @@ func (r *EmuNetReconciler) updateStatus(ctx context.Context, emunet *emunetv1.Em
 	return isFullyReady, nil
 }
 
-func (r *EmuNetReconciler) saveStatusToRedis(ctx context.Context, emunet *emunetv1.EmuNet, status *redis.EmuNetStatus, summary *redis.EmuNetSummary, forceFull bool) error {
-	if !r.shouldWriteFullStatus(emunet, forceFull) {
-		return r.Redis.SaveSummary(ctx, summary)
-	}
-
-	var allPods []redis.PodStatus
+func (r *EmuNetReconciler) saveStatusToRedis(ctx context.Context, emunet *emunetv1.EmuNet, status *redis.EmuNetStatus, summary *redis.EmuNetSummary, deletedPodNames []string) error {
+	var allPods []redis.ScoredPodStatus
 	for _, group := range status.ImageGroupStatus {
 		for _, pod := range group.PodStatuses {
-			allPods = append(allPods, pod)
+			allPods = append(allPods, redis.ScoredPodStatus{
+				Pod:   pod,
+				Score: float64(len(allPods)),
+			})
 		}
 	}
-	return r.Redis.SaveStatusBatch(ctx, status, allPods, summary)
+
+	if r.shouldWriteFullStatus(emunet) {
+		pods := make([]redis.PodStatus, 0, len(allPods))
+		for _, item := range allPods {
+			pods = append(pods, item.Pod)
+		}
+		r.rememberPodFingerprints(emunet, allPods)
+		return r.Redis.SaveStatusBatch(ctx, status, pods, summary)
+	}
+
+	changedPods := r.changedPodStatuses(emunet, allPods)
+	if err := r.Redis.DeletePodStatuses(ctx, emunet.Namespace, emunet.Name, deletedPodNames); err != nil {
+		return err
+	}
+	if len(changedPods) == 0 {
+		return r.Redis.SaveSummary(ctx, summary)
+	}
+	return r.Redis.SaveStatusDelta(ctx, status, changedPods, summary)
 }
 
-func (r *EmuNetReconciler) shouldWriteFullStatus(emunet *emunetv1.EmuNet, force bool) bool {
+func (r *EmuNetReconciler) shouldWriteFullStatus(emunet *emunetv1.EmuNet) bool {
 	r.statusWriteMu.Lock()
 	defer r.statusWriteMu.Unlock()
 
@@ -260,12 +278,63 @@ func (r *EmuNetReconciler) shouldWriteFullStatus(emunet *emunetv1.EmuNet, force 
 	key := fmt.Sprintf("%s/%s", emunet.Namespace, emunet.Name)
 	now := time.Now()
 	period := r.fullStatusSyncPeriod()
-	if force || r.lastFullStatusGeneration[key] != emunet.Generation || now.Sub(r.lastFullStatusWrite[key]) >= period {
+	if r.lastFullStatusGeneration[key] != emunet.Generation || now.Sub(r.lastFullStatusWrite[key]) >= period {
 		r.lastFullStatusWrite[key] = now
 		r.lastFullStatusGeneration[key] = emunet.Generation
 		return true
 	}
 	return false
+}
+
+func (r *EmuNetReconciler) changedPodStatuses(emunet *emunetv1.EmuNet, pods []redis.ScoredPodStatus) []redis.ScoredPodStatus {
+	r.statusWriteMu.Lock()
+	defer r.statusWriteMu.Unlock()
+
+	if r.lastPodFingerprint == nil {
+		r.lastPodFingerprint = map[string]map[string]string{}
+	}
+	key := fmt.Sprintf("%s/%s", emunet.Namespace, emunet.Name)
+	if r.lastPodFingerprint[key] == nil {
+		r.lastPodFingerprint[key] = map[string]string{}
+	}
+
+	changed := make([]redis.ScoredPodStatus, 0)
+	for _, pod := range pods {
+		fp := podStatusFingerprint(pod.Pod)
+		if r.lastPodFingerprint[key][pod.Pod.PodName] != fp {
+			r.lastPodFingerprint[key][pod.Pod.PodName] = fp
+			changed = append(changed, pod)
+		}
+	}
+	return changed
+}
+
+func (r *EmuNetReconciler) rememberPodFingerprints(emunet *emunetv1.EmuNet, pods []redis.ScoredPodStatus) {
+	r.statusWriteMu.Lock()
+	defer r.statusWriteMu.Unlock()
+
+	if r.lastPodFingerprint == nil {
+		r.lastPodFingerprint = map[string]map[string]string{}
+	}
+	key := fmt.Sprintf("%s/%s", emunet.Namespace, emunet.Name)
+	next := make(map[string]string, len(pods))
+	for _, pod := range pods {
+		next[pod.Pod.PodName] = podStatusFingerprint(pod.Pod)
+	}
+	r.lastPodFingerprint[key] = next
+}
+
+func podStatusFingerprint(pod redis.PodStatus) string {
+	return fmt.Sprintf("%s|%s|%s|%s|%t|%s|%s|%d",
+		pod.Image,
+		pod.PodIP,
+		pod.NodeName,
+		pod.Phase,
+		pod.Ready,
+		pod.Message,
+		pod.MACAddress,
+		pod.VethIfIndex,
+	)
 }
 
 func (r *EmuNetReconciler) podCreateBatchSize() int {
@@ -310,6 +379,7 @@ func (r *EmuNetReconciler) forgetStatusWriteState(nn types.NamespacedName) {
 	key := fmt.Sprintf("%s/%s", nn.Namespace, nn.Name)
 	delete(r.lastFullStatusWrite, key)
 	delete(r.lastFullStatusGeneration, key)
+	delete(r.lastPodFingerprint, key)
 }
 
 // --- Helpers ---

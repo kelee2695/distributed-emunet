@@ -30,6 +30,8 @@ func main() {
 	var redisAddr string
 	var redisPassword string
 	var redisDB int
+	var redisPoolSize int
+	var redisMinIdleConns int
 	var devMode bool
 	var webDir string
 	var pingConcurrency int
@@ -44,6 +46,8 @@ func main() {
 	flag.StringVar(&redisAddr, "redis-addr", "localhost:6379", "Redis server address")
 	flag.StringVar(&redisPassword, "redis-password", "", "Redis password")
 	flag.IntVar(&redisDB, "redis-db", 0, "Redis database number")
+	flag.IntVar(&redisPoolSize, "redis-pool-size", 50, "Redis connection pool size")
+	flag.IntVar(&redisMinIdleConns, "redis-min-idle-conns", 5, "Redis minimum idle connections")
 
 	flag.Parse()
 
@@ -63,7 +67,10 @@ func main() {
 	sugar.Info("Starting EmuNet Master API Server...")
 
 	// 2. 初始化 Redis
-	redisClient := redis.NewClient(redisAddr, redisPassword, redisDB)
+	redisClient := redis.NewClientWithOptions(redisAddr, redisPassword, redisDB, redis.ClientOptions{
+		PoolSize:     redisPoolSize,
+		MinIdleConns: redisMinIdleConns,
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := redisClient.Ping(ctx); err != nil {
 		sugar.Fatalw("failed to connect to Redis", "error", err, "address", redisAddr)

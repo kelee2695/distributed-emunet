@@ -43,23 +43,29 @@ func (ac *AgentClient) AddPodInfo(podName string, ifindex int, srcMac string) er
 	}
 
 	client := &http.Client{Timeout: ac.Timeout}
-	httpReq, err := http.NewRequest("POST", ac.BaseURL+"/api/podinfo/add", bytes.NewBuffer(reqBody))
-	if err != nil {
-		return fmt.Errorf("创建HTTP请求失败: %v", err)
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		httpReq, err := http.NewRequest("POST", ac.BaseURL+"/api/podinfo/add", bytes.NewReader(reqBody))
+		if err != nil {
+			return fmt.Errorf("创建HTTP请求失败: %v", err)
+		}
+
+		httpReq.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			lastErr = fmt.Errorf("发送HTTP请求失败: %v", err)
+		} else {
+			if resp.StatusCode == http.StatusOK {
+				resp.Body.Close()
+				return nil
+			}
+			lastErr = fmt.Errorf("调用agent服务失败，状态码: %d", resp.StatusCode)
+			resp.Body.Close()
+		}
+		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
 	}
 
-	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		return fmt.Errorf("发送HTTP请求失败: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("调用agent服务失败，状态码: %d", resp.StatusCode)
-	}
-
-	return nil
+	return lastErr
 }
 
 // DeletePodInfo 从agent服务删除PodInfo
